@@ -1,8 +1,8 @@
 {
-    "client_id": "ADD_YOURS",
-    "client_secret": "ADD_YOURS",
-    "redirect_uri": "ADD_YOURS",
-    "lastfm_api_key": "ADD_YOURS",
+    "client_id": "e560e65517344ba5aa0a4ce64e9b381a",
+    "client_secret": "25b79a7afe914f43a0dbe3f27a9298d5",
+    "redirect_uri": "http://127.0.0.1:8080",
+    "lastfm_api_key": "cc558887f7836939a2f8fae08245deea",
     "seed_queries": {
         "Stevie Wonder": "Superstition",
         "Red Hot Chili Peppers": "Easily",
