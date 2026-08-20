@@ -193,7 +193,7 @@ class SongRadio:
                 try:
                     results = self.sp.search(q=query, type="track", limit=self.search_limit, offset=offset)
                 except spotipy.exceptions.SpotifyException:
-                    continue
+                    raise KeyError("Some error with spotify. Most likely just invalid parameters.")
                 time.sleep(self.request_sleep)
 
                 items = results.get("tracks", {}).get("items", [])
