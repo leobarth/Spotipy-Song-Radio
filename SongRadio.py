@@ -1,14 +1,13 @@
 """
 Song Radio (Low-Mainstream Edition)
 
-Spotifys Development-Mode-API wurde Feb 2026 stark eingeschraenkt (u.a.
-Batch-Endpoints, "popularity" und die alten Playlist-Endpoints entfernt).
+Spotify's Development Mode API was heavily restricted in Feb 2026 (batch
+endpoints, "popularity", and the old playlist endpoints were removed).
 https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide
 
-Playlist-Erstellung/-Befuellung laeuft daher ueber rohe Requests
-(POST /me/playlists, POST /playlists/{id}/items), da spotipy intern noch
-die entfernten Endpoints (/users/{id}/playlists, /playlists/{id}/tracks)
-nutzt.
+Playlist creation/population therefore uses raw requests
+(POST /me/playlists, POST /playlists/{id}/items), since spotipy still uses
+the removed endpoints internally (/users/{id}/playlists, /playlists/{id}/tracks).
 """
 
 import re
@@ -36,7 +35,7 @@ class SongRadio:
         "legendary", "00s", "10s", "20s", "30s", "40s", "50s", "60s", "70s",
         "80s", "90s", "under 2000 listeners", "spotify",
     }
-    # Typische Zusaetze, die eine andere "Version" desselben Songs markieren
+    # Typical suffixes that mark a different "version" of the same song
     VERSION_SUFFIX_PATTERNS = [
         r"\s*-\s*\d{4}\s*remaster(ed)?.*$", r"\s*-\s*remaster(ed)?.*$",
         r"\s*\(\s*\d{4}\s*remaster(ed)?.*?\)", r"\s*\(remaster(ed)?.*?\)",
@@ -72,36 +71,36 @@ class SongRadio:
         max_total_candidates: int = 150,
         include_seed_tracks: bool = True,
     ):
-        """Initialisiert Spotify-/Last.fm-Clients und speichert die Konfiguration.
+        """Initializes the Spotify/Last.fm clients and stores the configuration.
 
         Args:
-            client_id: Spotify-App Client-ID.
-            client_secret: Spotify-App Client-Secret.
-            redirect_uri: Spotify-App Redirect-URI (fuer den OAuth-Flow).
-            lastfm_api_key: Last.fm API-Key (Genre-/Hoererzahlen-Daten).
-            seed_queries: Mapping {Kuenstlername: Songtitel} als Ausgangspunkt
-                fuer die Empfehlungen.
-            result_limit: Anzahl der Tracks, die am Ende zurueckgegeben werden.
-            genres_to_use: Anzahl der (spezifischsten) Genres, die fuer die
-                Genre-Suche verwendet werden.
-            min_artist_listeners: Mindest-Gesamthoererzahl eines Kuenstlers auf
-                Last.fm, um als Kandidat zu gelten.
-            lastfm_listener_ceiling: Maximale Hoererzahl eines einzelnen Tracks
-                auf Last.fm, um noch als "Hidden Gem" zu gelten.
-            artist_top_hit_exclude_n: Anzahl der meistgehoerten Tracks eines
-                Kuenstlers, die als "verbraucht" gelten und ausgeschlossen werden.
-            allowed_languages: Menge erlaubter Sprachcodes (z.B. "en", "de") fuer
-                die Spracherkennung der Songtitel.
-            excluded_artists: Kuenstlernamen, die nie als Kandidaten vorkommen sollen.
-            excluded_genres: Genre-Tags, die nie als Suchbegriff genutzt und deren
-                Kuenstler hart ausgeschlossen werden.
-            max_results_per_genre: Obergrenze an Suchergebnissen pro Genre-Query.
-            max_results_per_seed_artist: Obergrenze an Suchergebnissen pro
-                Seed-Kuenstler-Query.
-            max_total_candidates: Obergrenze an Kandidaten insgesamt, ab der die
-                Kandidatensuche vorzeitig abgebrochen wird.
-            include_seed_tracks: Ob die Seed-Tracks selbst mit in die spaeter
-                erstellte Playlist aufgenommen werden sollen.
+            client_id: Spotify app client ID.
+            client_secret: Spotify app client secret.
+            redirect_uri: Spotify app redirect URI (for the OAuth flow).
+            lastfm_api_key: Last.fm API key (genre/listener count data).
+            seed_queries: Mapping {artist name: song title} used as the
+                starting point for the recommendations.
+            result_limit: Number of tracks returned at the end.
+            genres_to_use: Number of (most specific) genres used for the
+                genre search.
+            min_artist_listeners: Minimum total listener count an artist must
+                have on Last.fm to be considered a candidate.
+            lastfm_listener_ceiling: Maximum listener count a single track may
+                have on Last.fm to still count as a "hidden gem".
+            artist_top_hit_exclude_n: Number of an artist's most-listened
+                tracks that count as "used up" and get excluded.
+            allowed_languages: Set of allowed language codes (e.g. "en", "de")
+                for the song title language detection.
+            excluded_artists: Artist names that should never appear as candidates.
+            excluded_genres: Genre tags that should never be used as a search
+                term and whose artists get hard-excluded.
+            max_results_per_genre: Upper bound on search results per genre query.
+            max_results_per_seed_artist: Upper bound on search results per
+                seed artist query.
+            max_total_candidates: Overall candidate cap at which candidate
+                gathering is stopped early.
+            include_seed_tracks: Whether the seed tracks themselves should be
+                included in the playlist created later.
 
         Returns:
             None.
@@ -113,7 +112,8 @@ class SongRadio:
                 redirect_uri=redirect_uri,
                 scope="user-library-read playlist-read-private playlist-modify-private playlist-modify-public",
             ),
-            retries=0,  # spotipy wuerde sonst selbst den vollen Retry-After abschlafen (ggf. Stunden)
+            retries=0,  # otherwise spotipy would sleep the full Retry-After itself (possibly hours)
+            requests_timeout=10,
         )
         self.lastfm_api_key = lastfm_api_key
         self.seed_queries = seed_queries
@@ -130,29 +130,29 @@ class SongRadio:
         self.max_total_candidates = max_total_candidates
         self.include_seed_tracks = include_seed_tracks
 
-        self.search_limit = 10  # Spotify-Maximum seit Feb 2026
-        self.request_sleep = 0.2  # etwas grosszuegiger, um Bursts zu vermeiden
-        self._max_offset = 990  # Sicherheitsgrenze fuer offset-Pagination
+        self.search_limit = 10  # Spotify maximum since Feb 2026
+        self.request_sleep = 0.2  # a bit generous, to avoid bursts
+        self._max_offset = 990  # safety cap for offset pagination
 
         self._artist_stats_cache = {}
         self._top_tracks_cache = {}
-        self.seed_tracks = []  # volle Track-Objekte, fuer Playlist-Aufnahme
+        self.seed_tracks = []  # full track objects, for playlist inclusion
         self.seed_artist_names = []
         self.picks = []
 
-    # --- Last.fm Helfer -----------------------------------------------
+    # --- Last.fm helpers -----------------------------------------------
 
     def _lastfm_get(self, method, **params):
-        """Fuehrt einen GET-Request gegen die Last.fm-API aus.
+        """Performs a GET request against the Last.fm API.
 
         Args:
-            method: Name der Last.fm-API-Methode (z.B. "artist.getInfo").
-            **params: Zusaetzliche Query-Parameter fuer den Request
-                (z.B. artist=..., track=..., limit=...).
+            method: Name of the Last.fm API method (e.g. "artist.getInfo").
+            **params: Additional query parameters for the request
+                (e.g. artist=..., track=..., limit=...).
 
         Returns:
-            Die per JSON dekodierte Antwort als dict, oder ein leeres dict
-            bei einem Request-Fehler.
+            The JSON-decoded response as a dict, or an empty dict on a
+            request failure.
         """
         try:
             resp = requests.get(
@@ -165,30 +165,30 @@ class SongRadio:
             return {}
 
     def lastfm_top_tags(self, artist_name, limit=8):
-        """Holt die meistvergebenen Last.fm-Tags (Genre/Style) eines Kuenstlers.
+        """Fetches the most-assigned Last.fm tags (genre/style) for an artist.
 
         Args:
-            artist_name: Name des Kuenstlers.
-            limit: Maximale Anzahl zurueckgegebener Tags.
+            artist_name: Name of the artist.
+            limit: Maximum number of tags returned.
 
         Returns:
-            Liste von Tag-Namen (kleingeschrieben), absteigend nach Haeufigkeit.
-            Leere Liste, falls keine Tags gefunden wurden oder der Request fehlschlug.
+            List of tag names (lowercased), in descending order of frequency.
+            Empty list if no tags were found or the request failed.
         """
         data = self._lastfm_get("artist.getTopTags", artist=artist_name)
         tags = data.get("toptags", {}).get("tag", [])
         return [t["name"].lower() for t in tags[:limit] if t.get("name")]
 
     def lastfm_track_listeners(self, artist_name, track_name):
-        """Holt die Hoererzahl eines einzelnen Tracks von Last.fm.
+        """Fetches the listener count of a single track from Last.fm.
 
         Args:
-            artist_name: Name des Kuenstlers.
-            track_name: Titel des Tracks.
+            artist_name: Name of the artist.
+            track_name: Title of the track.
 
         Returns:
-            Anzahl der Hoerer als int, oder None falls kein Last.fm-Eintrag
-            gefunden wurde oder der Request fehlschlug.
+            Number of listeners as an int, or None if no Last.fm entry was
+            found or the request failed.
         """
         data = self._lastfm_get("track.getInfo", artist=artist_name, track=track_name)
         try:
@@ -197,15 +197,15 @@ class SongRadio:
             return None
 
     def lastfm_artist_listeners(self, artist_name):
-        """Holt die Gesamthoererzahl eines Kuenstlers von Last.fm (gecacht).
+        """Fetches an artist's total listener count from Last.fm (cached).
 
         Args:
-            artist_name: Name des Kuenstlers.
+            artist_name: Name of the artist.
 
         Returns:
-            Gesamthoererzahl als int, oder None falls kein Last.fm-Eintrag
-            gefunden wurde oder der Request fehlschlug. Ergebnisse werden pro
-            Kuenstlername in self._artist_stats_cache gecacht.
+            Total listener count as an int, or None if no Last.fm entry was
+            found or the request failed. Results are cached per artist name
+            in self._artist_stats_cache.
         """
         if artist_name in self._artist_stats_cache:
             return self._artist_stats_cache[artist_name]
@@ -218,16 +218,16 @@ class SongRadio:
         return listeners
 
     def lastfm_artist_top_track_names(self, artist_name):
-        """Holt die Namen der meistgehoerten Tracks eines Kuenstlers (gecacht).
+        """Fetches the names of an artist's most-listened tracks (cached).
 
         Args:
-            artist_name: Name des Kuenstlers.
+            artist_name: Name of the artist.
 
         Returns:
-            Menge (set) von Tracknamen (kleingeschrieben), begrenzt auf
-            self.artist_top_hit_exclude_n Eintraege. Leere Menge, falls keine
-            Daten gefunden wurden oder der Request fehlschlug. Ergebnisse
-            werden pro Kuenstlername in self._top_tracks_cache gecacht.
+            Set of track names (lowercased), limited to
+            self.artist_top_hit_exclude_n entries. Empty set if no data was
+            found or the request failed. Results are cached per artist name
+            in self._top_tracks_cache.
         """
         if artist_name in self._top_tracks_cache:
             return self._top_tracks_cache[artist_name]
@@ -239,66 +239,66 @@ class SongRadio:
 
     @staticmethod
     def is_allowed_language(text, allowed_languages):
-        """Prueft per Best-effort-Spracherkennung, ob ein Text erlaubt ist.
+        """Checks via best-effort language detection whether a text is allowed.
 
         Args:
-            text: Zu pruefender Text (z.B. ein Songtitel).
-            allowed_languages: Menge erlaubter Sprachcodes (z.B. {"en", "de"}).
+            text: Text to check (e.g. a song title).
+            allowed_languages: Set of allowed language codes (e.g. {"en", "de"}).
 
         Returns:
-            True, wenn die erkannte Sprache in allowed_languages enthalten ist
-            oder die Erkennung fehlschlaegt (zu kurzer/unsicherer Text wird
-            durchgelassen statt faelschlich blockiert). Sonst False.
+            True if the detected language is contained in allowed_languages
+            or detection fails (a too-short/uncertain text is let through
+            rather than falsely blocked). Otherwise False.
         """
         try:
             return detect(text) in allowed_languages
         except LangDetectException:
-            return True  # zu kurz/unsicher -> durchlassen
+            return True  # too short/uncertain -> let it through
 
     @classmethod
     def normalize_title(cls, title):
-        """Normalisiert einen Songtitel fuer den Versions-Duplikat-Abgleich.
+        """Normalizes a song title for version-duplicate matching.
 
-        Entfernt Remaster-/Live-/Radio-Edit-/feat.-Zusaetze, damit verschiedene
-        Versionen desselben Songs auf denselben Schluessel abbilden.
+        Removes remaster/live/radio-edit/feat. suffixes so that different
+        versions of the same song map to the same key.
 
         Args:
-            title: Roher Songtitel.
+            title: Raw song title.
 
         Returns:
-            Normalisierter Titel: kleingeschrieben, Versions-Zusaetze entfernt,
-            nur alphanumerische Zeichen und einzelne Leerzeichen.
+            Normalized title: lowercased, version suffixes removed, only
+            alphanumeric characters and single spaces.
         """
         t = title.lower()
         for pattern in cls.VERSION_SUFFIX_PATTERNS:
             t = re.sub(pattern, "", t, flags=re.IGNORECASE)
         return re.sub(r"[^a-z0-9]+", " ", t).strip()
 
-    # --- Pipeline-Schritte ----------------------------------------------
+    # --- Pipeline steps ----------------------------------------------
 
     def resolve_seed_track_ids(self):
-        """Loest self.seed_queries per Suche in echte Spotify-Track-IDs auf.
+        """Resolves self.seed_queries into real Spotify track IDs via search.
 
-        Sucht pro (Kuenstler, Songtitel)-Paar bei Spotify und waehlt aus den
-        Ergebnissen den Treffer mit der besten Kuenstler-/Titel-Uebereinstimmung
-        (statt blind Treffer #1 zu vertrauen, da Spotifys Feldsuche eher fuzzy
-        matcht). Unsichere Treffer werden per Warnung auf der Konsole markiert.
+        Searches Spotify for each (artist, song title) pair and picks the
+        result with the best artist/title match (instead of blindly trusting
+        result #1, since Spotify's field search tends to match fuzzily).
+        Uncertain matches are flagged with a console warning.
 
         Args:
-            Keine.
+            None.
 
         Returns:
-            Liste von Spotify-Track-IDs (str), eine pro erfolgreich
-            aufgeloestem Seed. Seeds ohne Treffer werden uebersprungen.
+            List of Spotify track IDs (str), one per successfully resolved
+            seed. Seeds without a match are skipped.
         """
         track_ids = []
         for artist_name, track_name in self.seed_queries.items():
             results = self.sp.search(q=f"{track_name} {artist_name}", type="track", limit=10)
+            if not results:
+                print(f"Warning: No match found for '{track_name}' by {artist_name}.")
+                continue
             items = results.get("tracks", {}).get("items", [])
             time.sleep(self.request_sleep)
-            if not items:
-                print(f"Warnung: Kein Treffer fuer '{track_name}' von {artist_name}.")
-                continue
 
             def match_score(item):
                 item_artist = item["artists"][0]["name"].lower()
@@ -309,32 +309,33 @@ class SongRadio:
             best = max(items, key=match_score)
             artist_ok, title_sim = match_score(best)
             if not artist_ok or title_sim < 0.6:
-                print(f"Warnung: unsicherer Treffer fuer '{track_name}' -> '{best['name']}' ({title_sim:.2f}).")
+                print(f"Warning: uncertain match for '{track_name}' -> '{best['name']}' ({title_sim:.2f}).")
 
             track_ids.append(best["id"])
-            print(f"  Gefunden: {best['name']} by {best['artists'][0]['name']} ({best['id']})")
+            print(f"  Found: {best['name']} by {best['artists'][0]['name']} ({best['id']})")
         return track_ids
 
     def get_seed_artist_ids_and_genres(self, seed_track_ids):
-        """Holt Kuenstlerdaten und Genres zu den Seed-Tracks.
+        """Fetches artist data and genres for the seed tracks.
 
-        Laedt jeden Seed-Track einzeln (fuellt dabei self.seed_tracks und
-        self.seed_artist_names) und ermittelt Genres primaer ueber Last.fm
-        (artist.getTopTags), da Spotifys eigenes "genres"-Feld auf
-        Artist-Objekten haeufig leer ist. Nur falls Last.fm keine Tags liefert,
-        wird ersatzweise Spotifys artist.genres verwendet.
+        Loads each seed track individually (populating self.seed_tracks and
+        self.seed_artist_names) and determines genres primarily via Last.fm
+        (artist.getTopTags), since Spotify's own "genres" field on artist
+        objects is frequently empty. Only if Last.fm returns no tags does it
+        fall back to Spotify's artist.genres.
 
         Args:
-            seed_track_ids: Liste von Spotify-Track-IDs der Seed-Tracks.
+            seed_track_ids: List of Spotify track IDs of the seed tracks.
 
         Returns:
-            Tuple aus:
-                - Liste von Spotify-Artist-IDs (str), eine pro Seed-Track.
-                - Counter mit Genre-Tag -> Haeufigkeit ueber alle Seed-Kuenstler.
+            Tuple of:
+                - List of Spotify artist IDs (str), one per seed track.
+                - Counter mapping genre tag -> frequency across all seed artists.
         """
         artist_ids = []
         for track_id in seed_track_ids:
             track = self.sp.track(track_id)
+            assert track is not None, f"track {track_id} could not be resolved from its ID"
             self.seed_tracks.append(track)
             artist_ids.append(track["artists"][0]["id"])
             self.seed_artist_names.append(track["artists"][0]["name"])
@@ -348,35 +349,34 @@ class SongRadio:
         if not genre_counter:
             for artist_id in artist_ids:
                 artist = self.sp.artist(artist_id)
+                assert artist is not None, f"artist {artist_id} could not be resolved from its ID"
                 genre_counter.update(artist.get("genres", []))
                 time.sleep(self.request_sleep)
 
         return artist_ids, genre_counter
 
-    RATE_LIMIT_AUTO_RETRY_THRESHOLD = 30  # Sekunden - darueber: sofort abbrechen statt warten
+    RATE_LIMIT_AUTO_RETRY_THRESHOLD = 30  # seconds - above this: abort immediately instead of waiting
 
     def _paginated_search(self, query, max_results):
-        """Blaettert per offset durch Spotify-Suchergebnisse.
+        """Pages through Spotify search results via offset.
 
-        Erhoeht offset in Schritten von self.search_limit, bis entweder
-        max_results erreicht ist oder Spotify eine leere Ergebnisseite liefert
-        (Ende der gefilterten Datenbank). Behandelt 429-Antworten: kurze
-        Wartezeiten (<= RATE_LIMIT_AUTO_RETRY_THRESHOLD Sekunden) werden selbst
-        abgewartet und der Offset erneut versucht; lange/unbekannte Wartezeiten
-        fuehren zum sofortigen Abbruch (raise), um die Sperre nicht durch
-        weitere Requests zu verlaengern.
+        Increases offset in steps of self.search_limit until either
+        max_results is reached or Spotify returns an empty results page (end
+        of the filtered database). Handles 429 responses: short wait times
+        (<= RATE_LIMIT_AUTO_RETRY_THRESHOLD seconds) are waited out and the
+        offset retried; long/unknown wait times cause an immediate abort
+        (raise), so the lockout isn't extended by further requests.
 
         Args:
-            query: Spotify-Suchquery (z.B. 'genre:"funk rock"').
-            max_results: Obergrenze an gesammelten Ergebnissen fuer diese Query.
+            query: Spotify search query (e.g. 'genre:"funk rock"').
+            max_results: Upper bound on results collected for this query.
 
         Returns:
-            Liste von Spotify-Track-Objekten (dicts).
+            List of Spotify track objects (dicts).
 
         Raises:
-            spotipy.exceptions.SpotifyException: Bei einem 429 mit langer/
-                unbekannter Wartezeit, oder wenn spotipy die Exception erneut
-                wirft (via `raise`).
+            spotipy.exceptions.SpotifyException: On a 429 with a long/unknown
+                wait time, or when spotipy re-raises the exception (via `raise`).
         """
         collected = []
         offset = 0
@@ -384,53 +384,63 @@ class SongRadio:
             try:
                 results = self.sp.search(q=query, type="track", limit=self.search_limit, offset=offset)
             except spotipy.exceptions.SpotifyException as e:
+                # Check for 429 rate limit
                 if getattr(e, "http_status", None) == 429:
+                    # Safe access to the header, in case headers is None
+                    headers = getattr(e, "headers", {}) or {}
+                    raw_retry = headers.get("Retry-After")
                     retry_after = None
-                    try:
-                        retry_after = int(e.headers.get("Retry-After"))
-                    except (AttributeError, TypeError, ValueError):
-                        pass
-
+                    if raw_retry is not None:
+                        try:
+                            retry_after = int(raw_retry)
+                        except ValueError:
+                            print(f"Spotify sent an HTTP date instead of seconds: {raw_retry}")
+                            pass  # stays None, aborted below
                     if retry_after is not None and retry_after <= self.RATE_LIMIT_AUTO_RETRY_THRESHOLD:
-                        print(f"Kurzes Rate-Limit ({retry_after}s) - warte und versuche erneut...")
+                        print(f"Short rate limit ({retry_after}s) - waiting and retrying...")
                         time.sleep(retry_after + 1)
-                        continue  # denselben offset nochmal versuchen
-
-                    # Grosser/unbekannter Retry-After -> keine sinnvolle Wartezeit
-                    # fuer ein Skript, sofort abbrechen statt stundenlang zu haengen.
-                    wait_msg = f"{retry_after}s" if retry_after is not None else "unbekannt"
-                    print(f"Rate-Limit erreicht (Wartezeit: {wait_msg}) - breche komplett ab.")
-                    raise
-                break  # anderer Fehler (z.B. ungueltige Genre-Query) -> naechstes Genre/Artist probieren
+                        continue
+                    wait_msg = f"{retry_after}s" if retry_after is not None else f"unknown ({raw_retry})"
+                    print(f"Rate limit reached (wait time: {wait_msg}) - aborting completely.")
+                    raise  # hard-stops the script so it doesn't proceed as if it "succeeded"
+                else:
+                    # A DIFFERENT Spotify error occurred (e.g. 500, 400, 401)
+                    print(f"Unexpected API error for query '{query}': {e}")
+                    break  # skips THIS search, but continues with the next artist
+            except Exception as e:
+                # Catches general network timeouts (requests.exceptions.ReadTimeout)
+                print(f"Network or system error: {e}")
+                break
             time.sleep(self.request_sleep)
+            assert results is not None
             items = results.get("tracks", {}).get("items", [])
             if not items:
-                break  # Ende der gefilterten Datenbank erreicht
+                break  # reached the end of the filtered database
             collected.extend(items)
             offset += self.search_limit
         return collected
 
     def build_candidate_pool(self, genre_counter, exclude_artist_ids=None):
-        """Sammelt Kandidaten-Tracks per Genre- und Seed-Kuenstler-Suche.
+        """Gathers candidate tracks via genre and seed artist search.
 
-        Kombiniert zwei Quellen: (1) Suche nach den spezifischsten Genres aus
-        genre_counter, fuer Vielfalt an anderen Kuenstlern; (2) gezielte Suche
-        nach den Seed-Kuenstlern selbst, um deren Katalog (Deep Cuts) staerker
-        zu gewichten. Dedupliziert dabei ueber (Kuenstler, normalisierter
-        Titel), damit verschiedene Versionen desselben Songs nicht mehrfach
-        vorkommen, und schliesst die Seed-Tracks selbst sowie excluded_artists/
-        nicht erlaubte Sprachen aus.
+        Combines two sources: (1) search by the most specific genres from
+        genre_counter, for diversity across other artists; (2) a targeted
+        search for the seed artists themselves, to weight their catalog
+        (deep cuts) more heavily. Deduplicates via (artist, normalized title)
+        so different versions of the same song don't appear multiple times,
+        and excludes the seed tracks themselves as well as excluded_artists /
+        disallowed languages.
 
         Args:
-            genre_counter: Counter mit Genre-Tag -> Haeufigkeit (z.B. von
+            genre_counter: Counter mapping genre tag -> frequency (e.g. from
                 get_seed_artist_ids_and_genres).
-            exclude_artist_ids: Nicht mehr verwendet (Seed-Kuenstler werden
-                bewusst NICHT mehr komplett ausgeschlossen, da ihre Deep Cuts
-                vorkommen sollen). Nur fuer Abwaertskompatibilitaet vorhanden.
+            exclude_artist_ids: No longer used (seed artists are deliberately
+                NOT fully excluded anymore, since their deep cuts should
+                appear). Kept only for backward compatibility.
 
         Returns:
-            Liste von Spotify-Track-Objekten (dicts), einer pro einzigartigem
-            (Kuenstler, normalisierter Titel)-Schluessel.
+            List of Spotify track objects (dicts), one per unique
+            (artist, normalized title) key.
         """
         candidates = {}  # dedup_key -> track
 
@@ -445,18 +455,18 @@ class SongRadio:
             key = (artist_name.lower(), self.normalize_title(track["name"]))
             candidates.setdefault(key, track)
 
-        # Seed-Tracks selbst nie als "neue Empfehlung" durchgehen lassen
+        # Never let the seed tracks themselves count as a "new recommendation"
         for seed_track in self.seed_tracks:
             key = (seed_track["artists"][0]["name"].lower(), self.normalize_title(seed_track["name"]))
-            candidates[key] = None  # Platzhalter, wird unten rausgefiltert
+            candidates[key] = None  # placeholder, filtered out below
 
-        # 1) Genre-Suche fuer Vielfalt an anderen Kuenstlern
+        # 1) Genre search for diversity across other artists
         blocklist = self.GENERIC_GENRE_BLOCKLIST | self.LASTFM_JUNK_TAGS | self.excluded_genres
         specific_genres = [g for g in genre_counter if g not in blocklist]
         specific_genres.sort(key=lambda g: (-len(g.split()), -genre_counter[g]))
         top_genres = specific_genres[: self.genres_to_use] or \
             [g for g, _ in genre_counter.most_common(self.genres_to_use)] or ["pop"]
-        print(f"Verwendete Genres: {top_genres}")
+        print(f"Genres used: {top_genres}")
 
         for genre in top_genres:
             if len(candidates) >= self.max_total_candidates:
@@ -464,8 +474,8 @@ class SongRadio:
             for track in self._paginated_search(f'genre:"{genre}"', self.max_results_per_genre):
                 add_track(track)
 
-        # 2) Gezielte Suche nach den Seed-Kuenstlern, um deren Katalog
-        #    (Deep Cuts) staerker zu gewichten
+        # 2) Targeted search for the seed artists, to weight their catalog
+        #    (deep cuts) more heavily
         for artist_name in self.seed_artist_names:
             if len(candidates) >= self.max_total_candidates:
                 break
@@ -477,24 +487,24 @@ class SongRadio:
         return [t for t in candidates.values() if t is not None]
 
     def filter_and_rank(self, candidates):
-        """Filtert und waehlt die finalen Empfehlungen aus dem Kandidaten-Pool.
+        """Filters and selects the final recommendations from the candidate pool.
 
-        Filterkaskade pro Kandidat:
-            1. Last.fm-Genre-Tags gegen excluded_genres.
-            2. Kuenstler-Gesamthoerer >= min_artist_listeners (nur Untergrenze,
-               grosse Kuenstler sind erlaubt, solange der Song selbst obskur ist).
-            3. Track ist nicht einer der Top-Hits des Kuenstlers.
-            4. Track-Hoererzahl <= lastfm_listener_ceiling.
+        Filter cascade per candidate:
+            1. Last.fm genre tags against excluded_genres.
+            2. Artist's total listeners >= min_artist_listeners (lower bound
+               only, large artists are allowed as long as the song itself is obscure).
+            3. Track is not one of the artist's top hits.
+            4. Track listener count <= lastfm_listener_ceiling.
 
         Args:
-            candidates: Liste von Spotify-Track-Objekten (dicts), z.B. von
+            candidates: List of Spotify track objects (dicts), e.g. from
                 build_candidate_pool.
 
         Returns:
-            Liste von dicts mit den Schluesseln "track" (Spotify-Track-Objekt),
-            "track_listeners" (int oder None) und "artist_listeners" (int oder
-            None). Maximal self.result_limit Eintraege. Wird zusaetzlich in
-            self.picks gespeichert.
+            List of dicts with the keys "track" (Spotify track object),
+            "track_listeners" (int or None), and "artist_listeners" (int or
+            None). At most self.result_limit entries. Also stored in
+            self.picks.
         """
         pool = list(candidates)
         random.shuffle(pool)
@@ -524,26 +534,26 @@ class SongRadio:
             picks.append({"track": track, "track_listeners": track_listeners, "artist_listeners": artist_listeners})
 
         if len(picks) < self.result_limit:
-            print(f"Hinweis: Nur {len(picks)} passende Tracks gefunden (von {len(pool)} Kandidaten).")
+            print(f"Note: Only {len(picks)} matching tracks found (out of {len(pool)} candidates).")
 
         self.picks = picks
         return picks
 
-    # --- Ausgabe -----------------------------------------------------------
+    # --- Output -----------------------------------------------------------
 
     def print_results(self):
-        """Gibt die in self.picks gespeicherten Empfehlungen auf der Konsole aus.
+        """Prints the recommendations stored in self.picks to the console.
 
-        Zeigt pro Track Titel, Kuenstler, Song- und Kuenstler-Hoererzahl sowie
-        den Spotify-Link.
+        Shows title, artist, track and artist listener counts, and the
+        Spotify link for each track.
 
         Args:
-            Keine.
+            None.
 
         Returns:
             None.
         """
-        print("\n--- Empfohlene Tracks ---")
+        print("\n--- Recommended Tracks ---")
         for i, pick in enumerate(self.picks, 1):
             track = pick["track"]
             artist_name = track["artists"][0]["name"]
@@ -551,32 +561,33 @@ class SongRadio:
             track_listeners = pick["track_listeners"] if pick["track_listeners"] is not None else "?"
             artist_listeners = pick["artist_listeners"] if pick["artist_listeners"] is not None else "?"
             print(f"{i}. {track['name']} by {artist_name}")
-            print(f"   Song-Hoerer: {track_listeners} | Kuenstler-Hoerer: {artist_listeners} | Link: {url}")
+            print(f"   Track listeners: {track_listeners} | Artist listeners: {artist_listeners} | Link: {url}")
 
-    # --- Playlist (rohe Requests, siehe Modul-Docstring) --------------------
+    # --- Playlist (raw requests, see module docstring) --------------------
 
     def _bearer_headers(self):
-        """Baut HTTP-Header mit gueltigem Bearer-Token fuer rohe API-Requests.
+        """Builds HTTP headers with a valid bearer token for raw API requests.
 
         Args:
-            Keine.
+            None.
 
         Returns:
-            dict mit "Authorization"- und "Content-Type"-Headern.
+            dict with "Authorization" and "Content-Type" headers.
         """
+        assert self.sp.auth_manager is not None
         token = self.sp.auth_manager.get_access_token(as_dict=False)
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     def _existing_playlist_names(self):
-        """Liest die Namen aller Playlists des aktuellen Nutzers.
+        """Reads the names of all playlists of the current user.
 
-        Blaettert ueber alle Seiten von GET /me/playlists.
+        Pages through all pages of GET /me/playlists.
 
         Args:
-            Keine.
+            None.
 
         Returns:
-            Menge (set) der vorhandenen Playlist-Namen (str).
+            Set of existing playlist names (str).
         """
         names = set()
         results = self.sp.current_user_playlists(limit=50)
@@ -586,17 +597,17 @@ class SongRadio:
         return names
 
     def _unique_playlist_name(self, base_name):
-        """Erzeugt einen eindeutigen Playlist-Namen per Nummerierung.
+        """Generates a unique playlist name via numbering.
 
-        Prueft base_name gegen die vorhandenen Playlist-Namen des Nutzers und
-        haengt bei einer Kollision " #2", " #3" usw. an, bis der Name frei ist.
+        Checks base_name against the user's existing playlist names and
+        appends " #2", " #3", etc. on a collision, until the name is free.
 
         Args:
-            base_name: Gewuenschter Basis-Name der Playlist.
+            base_name: Desired base name of the playlist.
 
         Returns:
-            Eindeutiger Playlist-Name (str): base_name selbst, oder base_name
-            mit angehaengter Nummer.
+            Unique playlist name (str): either base_name itself, or base_name
+            with a number appended.
         """
         existing = self._existing_playlist_names()
         if base_name not in existing:
@@ -607,26 +618,26 @@ class SongRadio:
         return f"{base_name} #{n}"
 
     def save_as_playlist(self, base_name="Song Radio (Low-Mainstream)"):
-        """Erstellt eine private Playlist mit den Empfehlungen (+ optional Seeds).
+        """Creates a private playlist with the recommendations (+ optionally seeds).
 
-        Nutzt rohe HTTP-Requests statt spotipy-Methoden fuer Erstellung und
-        Befuellung, da die von spotipy intern genutzten Endpoints
-        (/users/{id}/playlists, /playlists/{id}/tracks) seit Feb 2026 entfernt
-        sind (siehe Modul-Docstring). Der Playlist-Name wird ueber
-        _unique_playlist_name deduplizierend nummeriert.
+        Uses raw HTTP requests instead of spotipy methods for creation and
+        population, since the endpoints spotipy uses internally
+        (/users/{id}/playlists, /playlists/{id}/tracks) were removed as of
+        Feb 2026 (see module docstring). The playlist name is deduplicated
+        via numbering through _unique_playlist_name.
 
         Args:
-            base_name: Gewuenschter Basis-Name der Playlist.
+            base_name: Desired base name of the playlist.
 
         Returns:
             None.
 
         Raises:
-            requests.exceptions.HTTPError: Falls das Erstellen der Playlist
-                oder das Hinzufuegen der Tracks fehlschlaegt.
+            requests.exceptions.HTTPError: If creating the playlist or adding
+                the tracks fails.
         """
         if not self.picks:
-            print("Keine Tracks zum Speichern vorhanden.")
+            print("No tracks available to save.")
             return
 
         uris = []
@@ -653,4 +664,4 @@ class SongRadio:
         )
         add_resp.raise_for_status()
 
-        print(f"Playlist '{name}' erstellt: {playlist['external_urls']['spotify']}")
+        print(f"Playlist '{name}' created: {playlist['external_urls']['spotify']}")
