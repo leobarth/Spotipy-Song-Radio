@@ -18,7 +18,7 @@ radio = SongRadio(**config)
 print("Resolving seed tracks...")
 seed_track_ids = radio.resolve_seed_track_ids()
 if not seed_track_ids:
-    raise KeyError("No seed tracks found - aborting.")
+    raise RuntimeError("No seed tracks found - aborting.")
 
 print("\nLoading artist data and genres...")
 seed_artist_ids, genre_counter = radio.get_seed_artist_ids_and_genres(seed_track_ids)
