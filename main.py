@@ -12,6 +12,8 @@ try:
 except FileNotFoundError:
     with open("config_template.json", "r") as file:
         config = json.load(file)
+except:
+    raise RuntimeError("Could not resolve config from file. Please ensure either 'config.json' or 'default_config.json' exists in this directory.")
 
 radio = SongRadio(**config)
 

@@ -144,25 +144,37 @@ class SongRadio:
 
     def _lastfm_get(self, method, **params):
         """Performs a GET request against the Last.fm API.
-
+ 
+        Last.fm has no known lockout risk like Spotify's rate limiting, so a
+        transient network hiccup (e.g. a read timeout) is retried once after
+        a short pause before giving up. On repeated failure, an empty dict is
+        returned rather than raising, so a single flaky Last.fm call doesn't
+        crash an entire run and lose an already-built candidate pool.
+ 
         Args:
             method: Name of the Last.fm API method (e.g. "artist.getInfo").
             **params: Additional query parameters for the request
                 (e.g. artist=..., track=..., limit=...).
-
+ 
         Returns:
-            The JSON-decoded response as a dict, or an empty dict on a
-            request failure.
+            The JSON-decoded response as a dict, or an empty dict if both
+            attempts failed.
         """
-        try:
-            resp = requests.get(
-                "https://ws.audioscrobbler.com/2.0/",
-                params={"method": method, "api_key": self.lastfm_api_key, "format": "json", **params},
-                timeout=5,
-            )
-            return resp.json()
-        except requests.RequestException:
-            return {}
+        for attempt in range(2):
+            try:
+                resp = requests.get(
+                    "https://ws.audioscrobbler.com/2.0/",
+                    params={"method": method, "api_key": self.lastfm_api_key, "format": "json", **params},
+                    timeout=5,
+                )
+                return resp.json()
+            except requests.RequestException as e:
+                if attempt == 0:
+                    print(f"Last.fm request failed ({e}), retrying once...")
+                    time.sleep(1)
+                else:
+                    print(f"Last.fm request failed again, giving up for this call: {e}")
+                    return {}
 
     def lastfm_top_tags(self, artist_name, limit=8):
         """Fetches the most-assigned Last.fm tags (genre/style) for an artist.
@@ -176,6 +188,7 @@ class SongRadio:
             Empty list if no tags were found or the request failed.
         """
         data = self._lastfm_get("artist.getTopTags", artist=artist_name)
+        assert data is not None
         tags = data.get("toptags", {}).get("tag", [])
         return [t["name"].lower() for t in tags[:limit] if t.get("name")]
 
@@ -191,6 +204,7 @@ class SongRadio:
             found or the request failed.
         """
         data = self._lastfm_get("track.getInfo", artist=artist_name, track=track_name)
+        assert data is not None
         try:
             return int(data["track"]["listeners"])
         except (KeyError, ValueError, TypeError):
@@ -210,6 +224,7 @@ class SongRadio:
         if artist_name in self._artist_stats_cache:
             return self._artist_stats_cache[artist_name]
         data = self._lastfm_get("artist.getInfo", artist=artist_name)
+        assert data is not None
         try:
             listeners = int(data["artist"]["stats"]["listeners"])
         except (KeyError, ValueError, TypeError):
@@ -218,7 +233,7 @@ class SongRadio:
         return listeners
 
     def lastfm_artist_top_track_names(self, artist_name):
-        """Fetches the names of an artist's most-listened tracks (cached).
+        """Fetches the names of an artist's most-listened to tracks (cached).
 
         Args:
             artist_name: Name of the artist.
@@ -232,6 +247,7 @@ class SongRadio:
         if artist_name in self._top_tracks_cache:
             return self._top_tracks_cache[artist_name]
         data = self._lastfm_get("artist.getTopTracks", artist=artist_name, limit=self.artist_top_hit_exclude_n)
+        assert data is not None
         tracks = data.get("toptracks", {}).get("track", [])
         names = {t["name"].lower() for t in tracks if t.get("name")}
         self._top_tracks_cache[artist_name] = names
@@ -266,8 +282,7 @@ class SongRadio:
             title: Raw song title.
 
         Returns:
-            Normalized title: lowercased, version suffixes removed, only
-            alphanumeric characters and single spaces.
+            Normalized title: lowercased, version suffixes removed, only alphanumeric characters and single spaces.
         """
         t = title.lower()
         for pattern in cls.VERSION_SUFFIX_PATTERNS:
@@ -420,7 +435,7 @@ class SongRadio:
             offset += self.search_limit
         return collected
 
-    def build_candidate_pool(self, genre_counter, exclude_artist_ids=None):
+    def build_candidate_pool(self, genre_counter):
         """Gathers candidate tracks via genre and seed artist search.
 
         Combines two sources: (1) search by the most specific genres from
@@ -434,9 +449,6 @@ class SongRadio:
         Args:
             genre_counter: Counter mapping genre tag -> frequency (e.g. from
                 get_seed_artist_ids_and_genres).
-            exclude_artist_ids: No longer used (seed artists are deliberately
-                NOT fully excluded anymore, since their deep cuts should
-                appear). Kept only for backward compatibility.
 
         Returns:
             List of Spotify track objects (dicts), one per unique
