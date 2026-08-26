@@ -72,6 +72,9 @@ class SongRadio:
         max_total_candidates: int = 150,
         include_seed_tracks: bool = True,
         cache_path: str = "spotify_search_cache.json",
+        cache_ttl_days: float = 30,
+        genre_pool_multiplier: int = 2,
+        min_track_listeners: int = 0,
     ):
         """Initializes the Spotify/Last.fm clients and stores the configuration.
 
@@ -106,6 +109,17 @@ class SongRadio:
             cache_path: Path to the local JSON file used to persist Spotify
                 search results across runs, so identical queries don't
                 re-fetch already-seen offsets and instead explore new ones.
+            cache_ttl_days: After how many days a cached query's exploration
+                state (offsets_fetched/exhausted) is reset so it gets
+                re-scanned from offset 0, to catch drift in Spotify's ranking.
+                Set to 0 to disable expiration entirely.
+            genre_pool_multiplier: Widens the genre candidate pool to
+                genres_to_use * genre_pool_multiplier before randomly
+                sampling genres_to_use from it, so the same seeds don't
+                always search the exact same genres every run.
+            min_track_listeners: Minimum Last.fm listener count a single
+                track must have to be considered (filters out tracks with
+                barely any listeners). 0 disables this floor.
 
         Returns:
             None.
@@ -147,6 +161,9 @@ class SongRadio:
 
         self.cache_path = cache_path
         self._search_cache = self._load_search_cache()
+        self.cache_ttl_days = cache_ttl_days
+        self.genre_pool_multiplier = genre_pool_multiplier
+        self.min_track_listeners = min_track_listeners
 
     # --- Last.fm helpers -----------------------------------------------
 
@@ -418,9 +435,13 @@ class SongRadio:
 
         Reuses previously cached results for this exact query (see
         self._search_cache) instead of re-fetching them, and only issues live
-        Spotify requests for offsets not yet visited by any prior run. The
-        cache is saved to disk after every fetched offset, so progress isn't
-        lost if the run aborts (e.g. on a 429).
+        Spotify requests for offsets not yet visited by any prior run. If the
+        cached entry is older than self.cache_ttl_days, its exploration state
+        (offsets_fetched/exhausted) is reset so it gets re-scanned from
+        offset 0 - this catches drift in Spotify's ranking over time, at the
+        cost of re-fetching the top results once. Previously found tracks are
+        never discarded. The cache is saved to disk after every fetched
+        offset, so progress isn't lost if the run aborts (e.g. on a 429).
 
         Args:
             query: Spotify search query (e.g. 'genre:"funk rock"').
@@ -435,8 +456,15 @@ class SongRadio:
                 wait time, or when spotipy re-raises the exception (via `raise`).
         """
         entry = self._search_cache["queries"].setdefault(
-            query, {"offsets_fetched": [], "exhausted": False, "track_ids": []}
+            query, {"offsets_fetched": [], "exhausted": False, "track_ids": [], "last_fetched_at": None}
         )
+
+        if self.cache_ttl_days and entry["last_fetched_at"]:
+            age_days = (time.time() - entry["last_fetched_at"]) / 86400
+            if age_days > self.cache_ttl_days:
+                entry["offsets_fetched"] = []
+                entry["exhausted"] = False
+
         tracks_by_id = self._search_cache["tracks"]
         collected = [tracks_by_id[tid] for tid in entry["track_ids"] if tid in tracks_by_id]
 
@@ -479,6 +507,7 @@ class SongRadio:
             assert results is not None
             items = results.get("tracks", {}).get("items", [])
             entry["offsets_fetched"].append(offset)
+            entry["last_fetched_at"] = time.time()
             if not items:
                 entry["exhausted"] = True
                 self._save_search_cache()
@@ -486,7 +515,8 @@ class SongRadio:
             for track in items:
                 if track and track.get("id"):
                     tracks_by_id[track["id"]] = track
-                    entry["track_ids"].append(track["id"])
+                    if track["id"] not in entry["track_ids"]:
+                        entry["track_ids"].append(track["id"])
                     collected.append(track)
             self._save_search_cache()  # persist after every offset, not just at the end
             offset += self.search_limit
@@ -495,9 +525,10 @@ class SongRadio:
     def build_candidate_pool(self, genre_counter):
         """Gathers candidate tracks via genre and seed artist search.
 
-        Combines two sources: (1) search by the most specific genres from
-        genre_counter, for diversity across other artists; (2) a targeted
-        search for the seed artists themselves, to weight their catalog
+        Combines two sources: (1) search by a random sample of genres_to_use
+        genres drawn from the genres_to_use * genre_pool_multiplier most
+        specific genres in genre_counter, for diversity across other artists
+        and across runs; (2) a targeted search for the seed artists themselves, to weight their catalog
         (deep cuts) more heavily. Deduplicates via (artist, normalized title)
         so different versions of the same song don't appear multiple times,
         and excludes the seed tracks themselves as well as excluded_artists /
@@ -533,8 +564,12 @@ class SongRadio:
         blocklist = self.GENERIC_GENRE_BLOCKLIST | self.LASTFM_JUNK_TAGS | self.excluded_genres
         specific_genres = [g for g in genre_counter if g not in blocklist]
         specific_genres.sort(key=lambda g: (-len(g.split()), -genre_counter[g]))
-        top_genres = specific_genres[: self.genres_to_use] or \
-            [g for g, _ in genre_counter.most_common(self.genres_to_use)] or ["pop"]
+        pool_size = min(len(specific_genres), self.genres_to_use * self.genre_pool_multiplier)
+        genre_pool = specific_genres[:pool_size]
+        if genre_pool:
+            top_genres = random.sample(genre_pool, min(self.genres_to_use, len(genre_pool)))
+        else:
+            top_genres = [g for g, _ in genre_counter.most_common(self.genres_to_use)] or ["pop"]
         print(f"Genres used: {top_genres}")
 
         for genre in top_genres:
@@ -564,6 +599,7 @@ class SongRadio:
                only, large artists are allowed as long as the song itself is obscure).
             3. Track is not one of the artist's top hits.
             4. Track listener count <= lastfm_listener_ceiling.
+            5. Track listener count >= min_track_listeners.
 
         Args:
             candidates: List of Spotify track objects (dicts), e.g. from
@@ -598,6 +634,8 @@ class SongRadio:
 
             track_listeners = self.lastfm_track_listeners(artist_name, track_name)
             if track_listeners is not None and track_listeners > self.lastfm_listener_ceiling:
+                continue
+            if track_listeners is not None and track_listeners < self.min_track_listeners:
                 continue
 
             picks.append({"track": track, "track_listeners": track_listeners, "artist_listeners": artist_listeners})
