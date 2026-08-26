@@ -62,7 +62,6 @@ class SongRadio:
         result_limit: int = 15,
         genres_to_use: int = 5,
         min_artist_listeners: int = 1_000,
-        min_track_listeners: int = 0,
         lastfm_listener_ceiling: int = 150_000,
         artist_top_hit_exclude_n: int = 5,
         allowed_languages: list = ["en", "de"],
@@ -75,6 +74,8 @@ class SongRadio:
         cache_path: str = "spotify_search_cache.json",
         cache_ttl_days: float = 30,
         genre_pool_multiplier: int = 2,
+        min_track_listeners: int = 0,
+        similarity_oversample_factor: int = 3,
     ):
         """Initializes the Spotify/Last.fm clients and stores the configuration.
 
@@ -120,6 +121,11 @@ class SongRadio:
             min_track_listeners: Minimum Last.fm listener count a single
                 track must have to be considered (filters out tracks with
                 barely any listeners). 0 disables this floor.
+            similarity_oversample_factor: How many times result_limit worth
+                of filter-passing candidates to gather before ranking by
+                genre similarity to the seeds and keeping the best
+                result_limit. Higher values give better similarity ranking
+                at the cost of more Last.fm requests.
 
         Returns:
             None.
@@ -164,6 +170,8 @@ class SongRadio:
         self.cache_ttl_days = cache_ttl_days
         self.genre_pool_multiplier = genre_pool_multiplier
         self.min_track_listeners = min_track_listeners
+        self.similarity_oversample_factor = similarity_oversample_factor
+        self.seed_genre_set = set()  # populated by get_seed_artist_ids_and_genres
 
     # --- Last.fm helpers -----------------------------------------------
 
@@ -358,7 +366,9 @@ class SongRadio:
         self.seed_artist_names) and determines genres primarily via Last.fm
         (artist.getTopTags), since Spotify's own "genres" field on artist
         objects is frequently empty. Only if Last.fm returns no tags does it
-        fall back to Spotify's artist.genres.
+        fall back to Spotify's artist.genres. Also stores the resulting genre
+        set as self.seed_genre_set for later genre-similarity ranking in
+        filter_and_rank.
 
         Args:
             seed_track_ids: List of Spotify track IDs of the seed tracks.
@@ -379,6 +389,9 @@ class SongRadio:
 
         genre_counter = Counter()
         for artist_name in self.seed_artist_names:
+            # limit=8 (default) leaves too few tags after blocklist filtering
+            # for genre_pool_multiplier to have anything meaningful to sample
+            # from. Fetch more raw tags instead.
             genre_counter.update(self.lastfm_top_tags(artist_name, limit=20))
             time.sleep(self.request_sleep)
 
@@ -389,6 +402,7 @@ class SongRadio:
                 genre_counter.update(artist.get("genres", []))
                 time.sleep(self.request_sleep)
 
+        self.seed_genre_set = set(genre_counter)
         return artist_ids, genre_counter
 
     RATE_LIMIT_AUTO_RETRY_THRESHOLD = 30  # seconds - above this: abort immediately instead of waiting
@@ -590,19 +604,43 @@ class SongRadio:
         candidates.pop(None, None)
         return [t for t in candidates.values() if t is not None]
 
+    def _genre_similarity(self, artist_tags):
+        """Computes Jaccard similarity between an artist's tags and the seeds.
+
+        Args:
+            artist_tags: Set of Last.fm tag names (lowercased) for a candidate's artist.
+
+        Returns:
+            Float in [0, 1]: |intersection| / |union| with self.seed_genre_set.
+            0.0 if either set is empty.
+        """
+        if not self.seed_genre_set or not artist_tags:
+            return 0.0
+        union = self.seed_genre_set | artist_tags
+        if not union:
+            return 0.0
+        return len(self.seed_genre_set & artist_tags) / len(union)
+
     MIN_TRACK_DURATION_MS = 60_000  # tracks shorter than this are filtered out by default
 
     def filter_and_rank(self, candidates):
-        """Filters and selects the final recommendations from the candidate pool.
+        """Filters candidates and ranks them by genre similarity to the seeds.
 
-        Filter cascade per candidate:
+        Filter cascade per candidate (same as before):
             1. Track duration > MIN_TRACK_DURATION_MS (no data needed, cheapest check first).
             2. Last.fm genre tags against excluded_genres.
             3. Artist's total listeners >= min_artist_listeners (lower bound
-            only, large artists are allowed as long as the song itself is obscure).
+               only, large artists are allowed as long as the song itself is obscure).
             4. Track is not one of the artist's top hits.
             5. Track listener count <= lastfm_listener_ceiling.
             6. Track listener count >= min_track_listeners.
+
+        Instead of stopping at the first result_limit passing candidates,
+        gathers up to result_limit * similarity_oversample_factor of them,
+        scores each by Jaccard similarity (see _genre_similarity) between its
+        artist's Last.fm tags and self.seed_genre_set, and keeps the
+        result_limit most similar ones. This costs more Last.fm requests than
+        a plain first-match selection, bounded by the oversample factor.
 
         Args:
             candidates: List of Spotify track objects (dicts), e.g. from
@@ -610,16 +648,19 @@ class SongRadio:
 
         Returns:
             List of dicts with the keys "track" (Spotify track object),
-            "track_listeners" (int or None), and "artist_listeners" (int or
-            None). At most self.result_limit entries. Also stored in
-            self.picks.
+            "track_listeners" (int or None), "artist_listeners" (int or
+            None), and "similarity" (float in [0, 1]). At most
+            self.result_limit entries, sorted by similarity descending. Also
+            stored in self.picks.
         """
         pool = list(candidates)
         random.shuffle(pool)
 
-        picks = []
+        oversample_target = self.result_limit * self.similarity_oversample_factor
+        scored = []
+
         for track in pool:
-            if len(picks) >= self.result_limit:
+            if len(scored) >= oversample_target:
                 break
 
             if track.get("duration_ms", 0) <= self.MIN_TRACK_DURATION_MS:
@@ -628,7 +669,8 @@ class SongRadio:
             artist_name = track["artists"][0]["name"]
             track_name = track["name"]
 
-            if self.excluded_genres and set(self.lastfm_top_tags(artist_name, limit=10)) & self.excluded_genres:
+            artist_tags = set(self.lastfm_top_tags(artist_name, limit=20))
+            if self.excluded_genres and artist_tags & self.excluded_genres:
                 continue
 
             artist_listeners = self.lastfm_artist_listeners(artist_name)
@@ -644,7 +686,16 @@ class SongRadio:
             if track_listeners is not None and track_listeners < self.min_track_listeners:
                 continue
 
-            picks.append({"track": track, "track_listeners": track_listeners, "artist_listeners": artist_listeners})
+            similarity = self._genre_similarity(artist_tags)
+            scored.append({
+                "track": track,
+                "track_listeners": track_listeners,
+                "artist_listeners": artist_listeners,
+                "similarity": similarity,
+            })
+
+        scored.sort(key=lambda p: p["similarity"], reverse=True)
+        picks = scored[: self.result_limit]
 
         if len(picks) < self.result_limit:
             print(f"Note: Only {len(picks)} matching tracks found (out of {len(pool)} candidates).")
@@ -673,8 +724,11 @@ class SongRadio:
             url = track["external_urls"]["spotify"]
             track_listeners = pick["track_listeners"] if pick["track_listeners"] is not None else "?"
             artist_listeners = pick["artist_listeners"] if pick["artist_listeners"] is not None else "?"
+            similarity = pick.get("similarity")
+            similarity_str = f"{similarity:.2f}" if similarity is not None else "?"
             print(f"{i}. {track['name']} by {artist_name}")
-            print(f"   Track listeners: {track_listeners} | Artist listeners: {artist_listeners} | Link: {url}")
+            print(f"   Track listeners: {track_listeners} | Artist listeners: {artist_listeners} | "
+                  f"Genre similarity: {similarity_str} | Link: {url}")
 
     # --- Playlist (raw requests, see module docstring) --------------------
 
