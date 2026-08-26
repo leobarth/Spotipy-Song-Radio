@@ -11,6 +11,7 @@ the removed endpoints internally (/users/{id}/playlists, /playlists/{id}/tracks)
 """
 
 import re
+import json
 import difflib
 import random
 import time
@@ -70,6 +71,7 @@ class SongRadio:
         max_results_per_seed_artist: int = 200,
         max_total_candidates: int = 150,
         include_seed_tracks: bool = True,
+        cache_path: str = "spotify_search_cache.json",
     ):
         """Initializes the Spotify/Last.fm clients and stores the configuration.
 
@@ -101,6 +103,9 @@ class SongRadio:
                 gathering is stopped early.
             include_seed_tracks: Whether the seed tracks themselves should be
                 included in the playlist created later.
+            cache_path: Path to the local JSON file used to persist Spotify
+                search results across runs, so identical queries don't
+                re-fetch already-seen offsets and instead explore new ones.
 
         Returns:
             None.
@@ -140,22 +145,25 @@ class SongRadio:
         self.seed_artist_names = []
         self.picks = []
 
+        self.cache_path = cache_path
+        self._search_cache = self._load_search_cache()
+
     # --- Last.fm helpers -----------------------------------------------
 
     def _lastfm_get(self, method, **params):
         """Performs a GET request against the Last.fm API.
- 
+
         Last.fm has no known lockout risk like Spotify's rate limiting, so a
         transient network hiccup (e.g. a read timeout) is retried once after
         a short pause before giving up. On repeated failure, an empty dict is
         returned rather than raising, so a single flaky Last.fm call doesn't
         crash an entire run and lose an already-built candidate pool.
- 
+
         Args:
             method: Name of the Last.fm API method (e.g. "artist.getInfo").
             **params: Additional query parameters for the request
                 (e.g. artist=..., track=..., limit=...).
- 
+
         Returns:
             The JSON-decoded response as a dict, or an empty dict if both
             attempts failed.
@@ -188,7 +196,6 @@ class SongRadio:
             Empty list if no tags were found or the request failed.
         """
         data = self._lastfm_get("artist.getTopTags", artist=artist_name)
-        assert data is not None
         tags = data.get("toptags", {}).get("tag", [])
         return [t["name"].lower() for t in tags[:limit] if t.get("name")]
 
@@ -204,7 +211,6 @@ class SongRadio:
             found or the request failed.
         """
         data = self._lastfm_get("track.getInfo", artist=artist_name, track=track_name)
-        assert data is not None
         try:
             return int(data["track"]["listeners"])
         except (KeyError, ValueError, TypeError):
@@ -224,7 +230,6 @@ class SongRadio:
         if artist_name in self._artist_stats_cache:
             return self._artist_stats_cache[artist_name]
         data = self._lastfm_get("artist.getInfo", artist=artist_name)
-        assert data is not None
         try:
             listeners = int(data["artist"]["stats"]["listeners"])
         except (KeyError, ValueError, TypeError):
@@ -247,7 +252,6 @@ class SongRadio:
         if artist_name in self._top_tracks_cache:
             return self._top_tracks_cache[artist_name]
         data = self._lastfm_get("artist.getTopTracks", artist=artist_name, limit=self.artist_top_hit_exclude_n)
-        assert data is not None
         tracks = data.get("toptracks", {}).get("track", [])
         names = {t["name"].lower() for t in tracks if t.get("name")}
         self._top_tracks_cache[artist_name] = names
@@ -372,6 +376,36 @@ class SongRadio:
 
     RATE_LIMIT_AUTO_RETRY_THRESHOLD = 30  # seconds - above this: abort immediately instead of waiting
 
+    def _load_search_cache(self):
+        """Loads the persistent Spotify search cache from disk.
+
+        Args:
+            None.
+
+        Returns:
+            dict with "tracks" (id -> track object, deduplicated globally)
+            and "queries" (query string -> {"offsets_fetched": list[int],
+            "exhausted": bool, "track_ids": list[str]}). Returns a fresh
+            empty structure if the file doesn't exist or is corrupted.
+        """
+        try:
+            with open(self.cache_path, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {"tracks": {}, "queries": {}}
+
+    def _save_search_cache(self):
+        """Persists the current search cache to disk.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        with open(self.cache_path, "w") as f:
+            json.dump(self._search_cache, f)
+
     def _paginated_search(self, query, max_results):
         """Pages through Spotify search results via offset.
 
@@ -382,9 +416,16 @@ class SongRadio:
         offset retried; long/unknown wait times cause an immediate abort
         (raise), so the lockout isn't extended by further requests.
 
+        Reuses previously cached results for this exact query (see
+        self._search_cache) instead of re-fetching them, and only issues live
+        Spotify requests for offsets not yet visited by any prior run. The
+        cache is saved to disk after every fetched offset, so progress isn't
+        lost if the run aborts (e.g. on a 429).
+
         Args:
             query: Spotify search query (e.g. 'genre:"funk rock"').
-            max_results: Upper bound on results collected for this query.
+            max_results: Upper bound on results collected for this query
+                (cached + newly fetched).
 
         Returns:
             List of Spotify track objects (dicts).
@@ -393,8 +434,16 @@ class SongRadio:
             spotipy.exceptions.SpotifyException: On a 429 with a long/unknown
                 wait time, or when spotipy re-raises the exception (via `raise`).
         """
-        collected = []
-        offset = 0
+        entry = self._search_cache["queries"].setdefault(
+            query, {"offsets_fetched": [], "exhausted": False, "track_ids": []}
+        )
+        tracks_by_id = self._search_cache["tracks"]
+        collected = [tracks_by_id[tid] for tid in entry["track_ids"] if tid in tracks_by_id]
+
+        if entry["exhausted"] or len(collected) >= max_results:
+            return collected
+
+        offset = (max(entry["offsets_fetched"]) + self.search_limit) if entry["offsets_fetched"] else 0
         while offset < max_results and offset <= self._max_offset:
             try:
                 results = self.sp.search(q=query, type="track", limit=self.search_limit, offset=offset)
@@ -429,9 +478,17 @@ class SongRadio:
             time.sleep(self.request_sleep)
             assert results is not None
             items = results.get("tracks", {}).get("items", [])
+            entry["offsets_fetched"].append(offset)
             if not items:
+                entry["exhausted"] = True
+                self._save_search_cache()
                 break  # reached the end of the filtered database
-            collected.extend(items)
+            for track in items:
+                if track and track.get("id"):
+                    tracks_by_id[track["id"]] = track
+                    entry["track_ids"].append(track["id"])
+                    collected.append(track)
+            self._save_search_cache()  # persist after every offset, not just at the end
             offset += self.search_limit
         return collected
 
