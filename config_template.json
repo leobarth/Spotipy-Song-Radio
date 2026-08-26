@@ -8,16 +8,18 @@
         "Red Hot Chili Peppers": "Easily",
         "Men At Work": "Underground"
     },
-    "result_limit": 10,
-    "genres_to_use": 8,
+    "result_limit": 20,
+    "genres_to_use": 4,
     "min_artist_listeners": 50000,
-    "lastfm_listener_ceiling": 1000000,
+    "min_track_listeners": 0,
+    "lastfm_listener_ceiling": 1000000000,
     "artist_top_hit_exclude_n": 5,
     "allowed_languages": ["en", "de"],
     "excluded_artists": [],
     "excluded_genres": [],
     "max_results_per_genre": 100,
-    "max_results_per_seed_artist": 100,
-    "max_total_candidates": 150,
-    "include_seed_tracks": true
+    "max_results_per_seed_artist": 20,
+    "max_total_candidates": 350,
+    "include_seed_tracks": true,
+    "genre_pool_multiplier": 2
 }
