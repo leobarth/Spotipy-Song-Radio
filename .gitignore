@@ -2,3 +2,4 @@
 config.json
 .cache
 __pycache__/
+spotify_search_cache.json
