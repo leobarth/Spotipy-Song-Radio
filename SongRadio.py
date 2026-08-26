@@ -62,6 +62,7 @@ class SongRadio:
         result_limit: int = 15,
         genres_to_use: int = 5,
         min_artist_listeners: int = 1_000,
+        min_track_listeners: int = 0,
         lastfm_listener_ceiling: int = 150_000,
         artist_top_hit_exclude_n: int = 5,
         allowed_languages: list = ["en", "de"],
@@ -74,7 +75,6 @@ class SongRadio:
         cache_path: str = "spotify_search_cache.json",
         cache_ttl_days: float = 30,
         genre_pool_multiplier: int = 2,
-        min_track_listeners: int = 0,
     ):
         """Initializes the Spotify/Last.fm clients and stores the configuration.
 
@@ -379,7 +379,7 @@ class SongRadio:
 
         genre_counter = Counter()
         for artist_name in self.seed_artist_names:
-            genre_counter.update(self.lastfm_top_tags(artist_name))
+            genre_counter.update(self.lastfm_top_tags(artist_name, limit=20))
             time.sleep(self.request_sleep)
 
         if not genre_counter:
@@ -590,16 +590,19 @@ class SongRadio:
         candidates.pop(None, None)
         return [t for t in candidates.values() if t is not None]
 
+    MIN_TRACK_DURATION_MS = 60_000  # tracks shorter than this are filtered out by default
+
     def filter_and_rank(self, candidates):
         """Filters and selects the final recommendations from the candidate pool.
 
         Filter cascade per candidate:
-            1. Last.fm genre tags against excluded_genres.
-            2. Artist's total listeners >= min_artist_listeners (lower bound
-               only, large artists are allowed as long as the song itself is obscure).
-            3. Track is not one of the artist's top hits.
-            4. Track listener count <= lastfm_listener_ceiling.
-            5. Track listener count >= min_track_listeners.
+            1. Track duration > MIN_TRACK_DURATION_MS (no data needed, cheapest check first).
+            2. Last.fm genre tags against excluded_genres.
+            3. Artist's total listeners >= min_artist_listeners (lower bound
+            only, large artists are allowed as long as the song itself is obscure).
+            4. Track is not one of the artist's top hits.
+            5. Track listener count <= lastfm_listener_ceiling.
+            6. Track listener count >= min_track_listeners.
 
         Args:
             candidates: List of Spotify track objects (dicts), e.g. from
@@ -618,6 +621,9 @@ class SongRadio:
         for track in pool:
             if len(picks) >= self.result_limit:
                 break
+
+            if track.get("duration_ms", 0) <= self.MIN_TRACK_DURATION_MS:
+                continue
 
             artist_name = track["artists"][0]["name"]
             track_name = track["name"]
