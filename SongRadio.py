@@ -221,6 +221,7 @@ class SongRadio:
             Empty list if no tags were found or the request failed.
         """
         data = self._lastfm_get("artist.getTopTags", artist=artist_name)
+        assert data is not None
         tags = data.get("toptags", {}).get("tag", [])
         return [t["name"].lower() for t in tags[:limit] if t.get("name")]
 
@@ -236,6 +237,7 @@ class SongRadio:
             found or the request failed.
         """
         data = self._lastfm_get("track.getInfo", artist=artist_name, track=track_name)
+        assert data is not None
         try:
             return int(data["track"]["listeners"])
         except (KeyError, ValueError, TypeError):
@@ -255,6 +257,7 @@ class SongRadio:
         if artist_name in self._artist_stats_cache:
             return self._artist_stats_cache[artist_name]
         data = self._lastfm_get("artist.getInfo", artist=artist_name)
+        assert data is not None
         try:
             listeners = int(data["artist"]["stats"]["listeners"])
         except (KeyError, ValueError, TypeError):
@@ -277,6 +280,7 @@ class SongRadio:
         if artist_name in self._top_tracks_cache:
             return self._top_tracks_cache[artist_name]
         data = self._lastfm_get("artist.getTopTracks", artist=artist_name, limit=self.artist_top_hit_exclude_n)
+        assert data is not None
         tracks = data.get("toptracks", {}).get("track", [])
         names = {t["name"].lower() for t in tracks if t.get("name")}
         self._top_tracks_cache[artist_name] = names
