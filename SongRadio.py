@@ -16,6 +16,7 @@ import difflib
 import random
 import time
 from collections import Counter
+from functools import lru_cache
 
 import requests
 import spotipy
@@ -283,8 +284,8 @@ class SongRadio:
         self._top_tracks_cache[artist_name] = names
         return names
 
-    @staticmethod
-    def is_allowed_language(text, allowed_languages):
+    @lru_cache(maxsize=None)
+    def is_allowed_language(self, text, allowed_languages):
         """Checks via best-effort language detection whether a text is allowed.
 
         Args:
@@ -568,10 +569,12 @@ class SongRadio:
             artist_name = track["artists"][0]["name"]
             if artist_name.lower() in self.excluded_artists:
                 return
-            if not self.is_allowed_language(track["name"], self.allowed_languages):
-                return
             key = (artist_name.lower(), self.normalize_title(track["name"]))
-            candidates.setdefault(key, track)
+            if key in candidates:
+                return
+            if not self.is_allowed_language(track["name"], frozenset(self.allowed_languages)):
+                return
+            candidates[key] = track
  
         def fetch_round_robin(query_to_artist, per_query_cap):
             """Cycles through queries, requesting results_per_turn new
@@ -650,40 +653,21 @@ class SongRadio:
     MIN_TRACK_DURATION_MS = 60_000  # tracks shorter than this are filtered out by default
 
     def filter_and_rank(self, candidates):
-        """Filters candidates and ranks them by genre similarity to the seeds.
-
-        Filter cascade per candidate (same as before):
-            1. Track duration > MIN_TRACK_DURATION_MS (no data needed, cheapest check first).
-            2. Last.fm genre tags against excluded_genres.
-            3. Artist's total listeners >= min_artist_listeners (lower bound
-               only, large artists are allowed as long as the song itself is obscure).
-            4. Track is not one of the artist's top hits.
-            5. Track listener count <= lastfm_listener_ceiling.
-            6. Track listener count >= min_track_listeners.
-
-        Instead of stopping at the first result_limit passing candidates,
-        gathers up to result_limit * similarity_oversample_factor of them,
-        scores each by Jaccard similarity (see _genre_similarity) between its
-        artist's Last.fm tags and self.seed_genre_set, and keeps the
-        result_limit most similar ones. This costs more Last.fm requests than
-        a plain first-match selection, bounded by the oversample factor.
-
-        Args:
-            candidates: List of Spotify track objects (dicts), e.g. from
-                build_candidate_pool.
-
-        Returns:
-            List of dicts with the keys "track" (Spotify track object),
-            "track_listeners" (int or None), "artist_listeners" (int or
-            None), and "similarity" (float in [0, 1]). At most
-            self.result_limit entries, sorted by similarity descending. Also
-            stored in self.picks.
-        """
         pool = list(candidates)
         random.shuffle(pool)
 
         oversample_target = self.result_limit * self.similarity_oversample_factor
         scored = []
+        artist_cache = {}  # artist_name -> dict of cached lookups
+
+        def get_artist_info(artist_name):
+            if artist_name not in artist_cache:
+                artist_cache[artist_name] = {
+                    "tags": set(self.lastfm_top_tags(artist_name, limit=20)),
+                    "listeners": self.lastfm_artist_listeners(artist_name),
+                    "top_tracks": self.lastfm_artist_top_track_names(artist_name),
+                }
+            return artist_cache[artist_name]
 
         for track in pool:
             if len(scored) >= oversample_target:
@@ -695,15 +679,13 @@ class SongRadio:
             artist_name = track["artists"][0]["name"]
             track_name = track["name"]
 
-            artist_tags = set(self.lastfm_top_tags(artist_name, limit=20))
-            if self.excluded_genres and artist_tags & self.excluded_genres:
-                continue
+            info = get_artist_info(artist_name)
 
-            artist_listeners = self.lastfm_artist_listeners(artist_name)
-            if artist_listeners is not None and artist_listeners < self.min_artist_listeners:
+            if self.excluded_genres and info["tags"] & self.excluded_genres:
                 continue
-
-            if track_name.lower() in self.lastfm_artist_top_track_names(artist_name):
+            if info["listeners"] is not None and info["listeners"] < self.min_artist_listeners:
+                continue
+            if track_name.lower() in info["top_tracks"]:
                 continue
 
             track_listeners = self.lastfm_track_listeners(artist_name, track_name)
@@ -712,20 +694,18 @@ class SongRadio:
             if track_listeners is not None and track_listeners < self.min_track_listeners:
                 continue
 
-            similarity = self._genre_similarity(artist_tags)
+            similarity = self._genre_similarity(info["tags"])
             scored.append({
                 "track": track,
                 "track_listeners": track_listeners,
-                "artist_listeners": artist_listeners,
+                "artist_listeners": info["listeners"],
                 "similarity": similarity,
             })
 
         scored.sort(key=lambda p: p["similarity"], reverse=True)
         picks = scored[: self.result_limit]
-
         if len(picks) < self.result_limit:
             print(f"Note: Only {len(picks)} matching tracks found (out of {len(pool)} candidates).")
-
         self.picks = picks
         return picks
 
