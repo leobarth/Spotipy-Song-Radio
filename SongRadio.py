@@ -24,17 +24,12 @@ from spotipy.oauth2 import SpotifyOAuth
 
 
 class SongRadio:
-    GENERIC_GENRE_BLOCKLIST = {
-        "pop", "rock", "soul", "funk", "hip hop", "rap", "dance", "r&b",
-        "classic rock", "alternative", "indie", "singer-songwriter",
-    }
     LASTFM_JUNK_TAGS = {
         "seen live", "favorites", "favourite", "favourites", "amazing", "awesome",
         "love", "beautiful", "usa", "american", "uk", "british", "australian",
         "male vocalists", "female vocalists", "instrumental", "cover", "covers",
         "guilty pleasure", "guilty pleasures", "classic", "classics", "legend",
-        "legendary", "00s", "10s", "20s", "30s", "40s", "50s", "60s", "70s",
-        "80s", "90s", "under 2000 listeners", "spotify",
+        "legendary", "under 2000 listeners", "spotify",
     }
     # Typical suffixes that mark a different "version" of the same song
     VERSION_SUFFIX_PATTERNS = [
@@ -67,6 +62,7 @@ class SongRadio:
         allowed_languages: list = ["en", "de"],
         excluded_artists: list = [],
         excluded_genres: list = [],
+        results_per_turn: int = 10,
         max_results_per_genre: int = 300,
         max_results_per_seed_artist: int = 200,
         max_total_candidates: int = 150,
@@ -150,6 +146,7 @@ class SongRadio:
         self.allowed_languages = set(allowed_languages)
         self.excluded_artists = {a.lower() for a in excluded_artists}
         self.excluded_genres = {g.lower() for g in excluded_genres}
+        self.results_per_turn = results_per_turn
         self.max_results_per_genre = max_results_per_genre
         self.max_results_per_seed_artist = max_results_per_seed_artist
         self.max_total_candidates = max_total_candidates
@@ -542,26 +539,29 @@ class SongRadio:
 
     def build_candidate_pool(self, genre_counter):
         """Gathers candidate tracks via genre and seed artist search.
-
-        Combines two sources: (1) search by a random sample of genres_to_use
-        genres drawn from the genres_to_use * genre_pool_multiplier most
-        specific genres in genre_counter, for diversity across other artists
-        and across runs; (2) a targeted search for the seed artists themselves, to weight their catalog
-        (deep cuts) more heavily. Deduplicates via (artist, normalized title)
-        so different versions of the same song don't appear multiple times,
-        and excludes the seed tracks themselves as well as excluded_artists /
-        disallowed languages.
-
+ 
+        Combines two sources, each fetched round-robin (results_per_turn new
+        results per query per turn, cycling through queries) so that no
+        single genre or seed artist drains its full budget before the others
+        get a turn: (1) search by a random sample of genres_to_use genres
+        drawn from the genres_to_use * genre_pool_multiplier most specific
+        genres in genre_counter, for diversity across other artists and
+        across runs; (2) a targeted search for the seed artists themselves,
+        to weight their catalog (deep cuts) more heavily. Deduplicates via
+        (artist, normalized title) so different versions of the same song
+        don't appear multiple times, and excludes the seed tracks themselves
+        as well as excluded_artists / disallowed languages.
+ 
         Args:
             genre_counter: Counter mapping genre tag -> frequency (e.g. from
                 get_seed_artist_ids_and_genres).
-
+ 
         Returns:
             List of Spotify track objects (dicts), one per unique
             (artist, normalized title) key.
         """
         candidates = {}  # dedup_key -> track
-
+ 
         def add_track(track):
             if not track or not track.get("id"):
                 return
@@ -572,14 +572,39 @@ class SongRadio:
                 return
             key = (artist_name.lower(), self.normalize_title(track["name"]))
             candidates.setdefault(key, track)
-
+ 
+        def fetch_round_robin(query_to_artist, per_query_cap):
+            """Cycles through queries, requesting results_per_turn new
+            results per query per round, until every query is exhausted or
+            at its per_query_cap, or max_total_candidates is reached."""
+            requested = {q: 0 for q in query_to_artist}
+            active = set(query_to_artist)
+            while active and len(candidates) < self.max_total_candidates:
+                for q in list(active):
+                    if len(candidates) >= self.max_total_candidates:
+                        break
+                    target = min(requested[q] + self.results_per_turn, per_query_cap)
+                    results = self._paginated_search(q, target)
+                    requested[q] = target
+                    artist_name = query_to_artist[q]
+                    for track in results:
+                        if len(candidates) >= self.max_total_candidates:
+                            break
+                        if artist_name and not any(
+                            a["name"].lower() == artist_name.lower() for a in track["artists"]
+                        ):
+                            continue
+                        add_track(track)
+                    if len(results) < target or target >= per_query_cap:
+                        active.discard(q)
+ 
         # Never let the seed tracks themselves count as a "new recommendation"
         for seed_track in self.seed_tracks:
             key = (seed_track["artists"][0]["name"].lower(), self.normalize_title(seed_track["name"]))
             candidates[key] = None  # placeholder, filtered out below
-
+ 
         # 1) Genre search for diversity across other artists
-        blocklist = self.GENERIC_GENRE_BLOCKLIST | self.LASTFM_JUNK_TAGS | self.excluded_genres
+        blocklist = self.LASTFM_JUNK_TAGS | self.excluded_genres
         specific_genres = [g for g in genre_counter if g not in blocklist]
         specific_genres.sort(key=lambda g: (-len(g.split()), -genre_counter[g]))
         pool_size = min(len(specific_genres), self.genres_to_use * self.genre_pool_multiplier)
@@ -589,22 +614,19 @@ class SongRadio:
         else:
             top_genres = [g for g, _ in genre_counter.most_common(self.genres_to_use)] or ["pop"]
         print(f"Genres used: {top_genres}")
-
-        for genre in top_genres:
-            if len(candidates) >= self.max_total_candidates:
-                break
-            for track in self._paginated_search(f'genre:"{genre}"', self.max_results_per_genre):
-                add_track(track)
-
+ 
+        fetch_round_robin(
+            {f'genre:"{g}"': None for g in top_genres},
+            self.max_results_per_genre,
+        )
+ 
         # 2) Targeted search for the seed artists, to weight their catalog
         #    (deep cuts) more heavily
-        for artist_name in self.seed_artist_names:
-            if len(candidates) >= self.max_total_candidates:
-                break
-            for track in self._paginated_search(f'artist:"{artist_name}"', self.max_results_per_seed_artist):
-                if any(a["name"].lower() == artist_name.lower() for a in track["artists"]):
-                    add_track(track)
-
+        fetch_round_robin(
+            {f'artist:"{a}"': a for a in self.seed_artist_names},
+            self.max_results_per_seed_artist,
+        )
+ 
         candidates.pop(None, None)
         return [t for t in candidates.values() if t is not None]
 
