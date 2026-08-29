@@ -8,20 +8,147 @@ https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migr
 Playlist creation/population therefore uses raw requests
 (POST /me/playlists, POST /playlists/{id}/items), since spotipy still uses
 the removed endpoints internally (/users/{id}/playlists, /playlists/{id}/tracks).
+
+Last.fm API calls
+------------------
+Last.fm has no documented hard rate limit (unlike Spotify), so this module
+treats it defensively rather than optimistically:
+  - every request goes through exponential backoff with jitter, and a 429
+    is treated as an early warning rather than a hard failure: it's retried
+    (respecting Retry-After if present) instead of aborting outright.
+  - a rolling-window monitor (LastFmRequestMonitor) tracks error/429 rates
+    per API key and logs alerts when they rise, independent of whether any
+    individual request ultimately succeeds.
+  - concurrent fetching (ThreadPoolExecutor) is used to shorten wall-clock
+    time, but concurrency is adaptive: it backs off when the monitor sees
+    elevated 429s and only cautiously ramps back up after a run of clean
+    batches.
+  - Last.fm has no multi-artist "batch" endpoint, so "batching" here means
+    firing several single-artist requests concurrently, not a single
+    multi-entity request. Artist-level results (tags, listener counts, top
+    tracks) are cached for the lifetime of the instance so no artist is
+    ever queried twice.
 """
 
+import logging
+import random
 import re
 import json
 import difflib
-import random
+import threading
 import time
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
 import requests
 import spotipy
 from langdetect import LangDetectException, detect
 from spotipy.oauth2 import SpotifyOAuth
+
+logger = logging.getLogger("song_radio.lastfm")
+
+
+class LastFmRequestMonitor:
+    """Tracks Last.fm request outcomes and raises alerts on elevated error/429 rates.
+
+    Thread-safe. Keeps a rolling window of the most recent request outcomes
+    (per API key) rather than a lifetime average, so a recent spike in
+    errors or 429s is visible even if the instance has made thousands of
+    clean requests earlier in the run.
+    """
+
+    def __init__(self, api_key, window_size=40, error_rate_alert=0.3, throttle_rate_alert=0.15):
+        """Initializes the monitor.
+
+        Args:
+            api_key: The Last.fm API key being monitored (only its last 4
+                characters are ever logged, to avoid leaking the key).
+            window_size: Number of most recent outcomes considered when
+                computing rolling error/throttle rates.
+            error_rate_alert: Rolling error rate (network errors, 5xx) at or
+                above which an alert is logged.
+            throttle_rate_alert: Rolling 429 rate at or above which an alert
+                is logged and the caller is expected to reduce concurrency.
+
+        Returns:
+            None.
+        """
+        self.api_key = api_key
+        self.window_size = window_size
+        self.error_rate_alert = error_rate_alert
+        self.throttle_rate_alert = throttle_rate_alert
+        self._lock = threading.Lock()
+        self._outcomes = deque(maxlen=window_size)  # "ok" | "error" | "throttled"
+        self.total_requests = 0
+        self.total_errors = 0
+        self.total_throttled = 0
+        self._alerted_error = False
+        self._alerted_throttle = False
+
+    def record(self, outcome):
+        """Records a single request outcome and logs alerts if thresholds are crossed.
+
+        Args:
+            outcome: One of "ok", "error", "throttled".
+
+        Returns:
+            None.
+        """
+        with self._lock:
+            self.total_requests += 1
+            if outcome == "error":
+                self.total_errors += 1
+            elif outcome == "throttled":
+                self.total_throttled += 1
+            self._outcomes.append(outcome)
+
+            if self.total_requests % 25 == 0:
+                logger.info(
+                    "Last.fm key ...%s: %d requests so far (%d errors, %d throttled).",
+                    self.api_key[-4:], self.total_requests, self.total_errors, self.total_throttled,
+                )
+
+            if len(self._outcomes) < self.window_size:
+                return
+
+            error_rate = sum(1 for o in self._outcomes if o == "error") / len(self._outcomes)
+            throttle_rate = sum(1 for o in self._outcomes if o == "throttled") / len(self._outcomes)
+
+            if error_rate >= self.error_rate_alert and not self._alerted_error:
+                logger.warning(
+                    "ALERT: Last.fm error rate %.0f%% over the last %d requests (key ...%s).",
+                    error_rate * 100, self.window_size, self.api_key[-4:],
+                )
+                self._alerted_error = True
+            elif error_rate < self.error_rate_alert * 0.5:
+                self._alerted_error = False  # recovered; allow re-alerting if it climbs again
+
+            if throttle_rate >= self.throttle_rate_alert and not self._alerted_throttle:
+                logger.warning(
+                    "ALERT: Last.fm 429 rate %.0f%% over the last %d requests (key ...%s) "
+                    "- concurrency should be reduced.",
+                    throttle_rate * 100, self.window_size, self.api_key[-4:],
+                )
+                self._alerted_throttle = True
+            elif throttle_rate < self.throttle_rate_alert * 0.5:
+                self._alerted_throttle = False
+
+    @property
+    def recent_throttle_rate(self):
+        """Current rolling 429 rate.
+
+        Args:
+            None.
+
+        Returns:
+            Float in [0, 1]. 0.0 if fewer than window_size requests have
+            been recorded yet.
+        """
+        with self._lock:
+            if not self._outcomes:
+                return 0.0
+            return sum(1 for o in self._outcomes if o == "throttled") / len(self._outcomes)
 
 
 class SongRadio:
@@ -48,6 +175,9 @@ class SongRadio:
         r"\s*\(feat\..*?\)", r"\s*\(with .*?\)",
     ]
 
+    MIN_TRACK_DURATION_MS = 60_000  # tracks shorter than this are filtered out by default
+    RATE_LIMIT_AUTO_RETRY_THRESHOLD = 30  # seconds - above this: abort immediately instead of waiting
+
     def __init__(
         self,
         client_id: str,
@@ -73,6 +203,13 @@ class SongRadio:
         genre_pool_multiplier: int = 2,
         min_track_listeners: int = 0,
         similarity_oversample_factor: int = 3,
+        lastfm_max_workers: int = 4,
+        lastfm_batch_size: int = 12,
+        lastfm_max_retries: int = 4,
+        lastfm_backoff_base: float = 1.0,
+        lastfm_throttle_rate_alert: float = 0.15,
+        lastfm_error_rate_alert: float = 0.3,
+        lastfm_monitor_window: int = 40,
     ):
         """Initializes the Spotify/Last.fm clients and stores the configuration.
 
@@ -123,6 +260,30 @@ class SongRadio:
                 genre similarity to the seeds and keeping the best
                 result_limit. Higher values give better similarity ranking
                 at the cost of more Last.fm requests.
+            lastfm_max_workers: Maximum number of concurrent Last.fm requests
+                in a batch. This is a ceiling, not a fixed value - the
+                effective concurrency adapts downward if 429s are observed
+                (see LastFmRequestMonitor) and only cautiously climbs back
+                toward this ceiling afterward.
+            lastfm_batch_size: Number of pool tracks processed together per
+                concurrent batch in filter_and_rank. Larger batches use
+                concurrency more efficiently but risk overshooting the
+                early-stop target (oversample_target) by up to one batch's
+                worth of unnecessary Last.fm lookups.
+            lastfm_max_retries: Maximum attempts (including the first) for a
+                single Last.fm request before giving up and treating it as
+                failed (returns None/empty for that lookup).
+            lastfm_backoff_base: Base delay in seconds for exponential
+                backoff between retries (delay ~= base * 2**attempt, plus
+                jitter). Also used as a fallback when a 429 response has no
+                usable Retry-After header.
+            lastfm_throttle_rate_alert: Rolling 429 rate (see
+                LastFmRequestMonitor) at or above which concurrency is
+                reduced and an alert is logged.
+            lastfm_error_rate_alert: Rolling network/5xx error rate at or
+                above which an alert is logged.
+            lastfm_monitor_window: Number of most recent Last.fm requests
+                considered when computing rolling error/429 rates.
 
         Returns:
             None.
@@ -159,6 +320,10 @@ class SongRadio:
 
         self._artist_stats_cache = {}
         self._top_tracks_cache = {}
+        self._tags_cache = {}
+        self._artist_info_cache = {}
+        self._cache_lock = threading.Lock()
+
         self.seed_tracks = []  # full track objects, for playlist inclusion
         self.seed_artist_names = []
         self.picks = []
@@ -171,16 +336,29 @@ class SongRadio:
         self.similarity_oversample_factor = similarity_oversample_factor
         self.seed_genre_set = set()  # populated by get_seed_artist_ids_and_genres
 
+        self.lastfm_max_workers = lastfm_max_workers
+        self.lastfm_batch_size = lastfm_batch_size
+        self.lastfm_max_retries = lastfm_max_retries
+        self.lastfm_backoff_base = lastfm_backoff_base
+        self._lastfm_monitor = LastFmRequestMonitor(
+            api_key=lastfm_api_key,
+            window_size=lastfm_monitor_window,
+            error_rate_alert=lastfm_error_rate_alert,
+            throttle_rate_alert=lastfm_throttle_rate_alert,
+        )
+
     # --- Last.fm helpers -----------------------------------------------
 
     def _lastfm_get(self, method, **params):
-        """Performs a GET request against the Last.fm API.
+        """Performs a GET request against the Last.fm API with retry/backoff.
 
-        Last.fm has no known lockout risk like Spotify's rate limiting, so a
-        transient network hiccup (e.g. a read timeout) is retried once after
-        a short pause before giving up. On repeated failure, an empty dict is
-        returned rather than raising, so a single flaky Last.fm call doesn't
-        crash an entire run and lose an already-built candidate pool.
+        There's no confirmed hard rate limit on the Last.fm API, so a 429 is
+        treated as an early warning rather than a hard wall: it's retried
+        with exponential backoff (respecting a Retry-After header if
+        present) rather than failing immediately. Every outcome (ok, error,
+        throttled) is recorded in self._lastfm_monitor, which is what the
+        concurrent fetch layer in filter_and_rank uses to decide whether to
+        reduce concurrency.
 
         Args:
             method: Name of the Last.fm API method (e.g. "artist.getInfo").
@@ -188,27 +366,73 @@ class SongRadio:
                 (e.g. artist=..., track=..., limit=...).
 
         Returns:
-            The JSON-decoded response as a dict, or an empty dict if both
-            attempts failed.
+            The JSON-decoded response as a dict, or an empty dict if every
+            attempt failed.
         """
-        for attempt in range(2):
+        max_attempts = self.lastfm_max_retries
+        base_delay = self.lastfm_backoff_base
+
+        for attempt in range(max_attempts):
+            is_last_attempt = attempt == max_attempts - 1
+
             try:
                 resp = requests.get(
                     "https://ws.audioscrobbler.com/2.0/",
                     params={"method": method, "api_key": self.lastfm_api_key, "format": "json", **params},
                     timeout=5,
                 )
-                return resp.json()
             except requests.RequestException as e:
-                if attempt == 0:
-                    print(f"Last.fm request failed ({e}), retrying once...")
-                    time.sleep(1)
-                else:
-                    print(f"Last.fm request failed again, giving up for this call: {e}")
+                self._lastfm_monitor.record("error")
+                if is_last_attempt:
+                    logger.warning("Last.fm request failed after %d attempts (%s): %s", max_attempts, method, e)
                     return {}
+                time.sleep(base_delay * (2 ** attempt) + random.uniform(0, base_delay))
+                continue
+
+            if resp.status_code == 429:
+                self._lastfm_monitor.record("throttled")
+                if is_last_attempt:
+                    logger.warning(
+                        "Last.fm kept returning 429 for %s after %d attempts, giving up on this call.",
+                        method, max_attempts,
+                    )
+                    return {}
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        delay = float(retry_after)
+                    except ValueError:
+                        delay = base_delay * (2 ** attempt)
+                else:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, base_delay)
+                time.sleep(delay)
+                continue
+
+            if resp.status_code >= 500:
+                self._lastfm_monitor.record("error")
+                if is_last_attempt:
+                    logger.warning("Last.fm returned %d for %s after %d attempts, giving up.",
+                                    resp.status_code, method, max_attempts)
+                    return {}
+                time.sleep(base_delay * (2 ** attempt) + random.uniform(0, base_delay))
+                continue
+
+            try:
+                data = resp.json()
+            except ValueError as e:
+                self._lastfm_monitor.record("error")
+                logger.warning("Last.fm response for %s was not valid JSON: %s", method, e)
+                return {}
+
+            self._lastfm_monitor.record("ok")
+            return data
+
+        return {}
 
     def lastfm_top_tags(self, artist_name, limit=8):
         """Fetches the most-assigned Last.fm tags (genre/style) for an artist.
+
+        Cached per (artist_name, limit) for the lifetime of the instance.
 
         Args:
             artist_name: Name of the artist.
@@ -218,10 +442,20 @@ class SongRadio:
             List of tag names (lowercased), in descending order of frequency.
             Empty list if no tags were found or the request failed.
         """
+        cache_key = (artist_name, limit)
+        with self._cache_lock:
+            cached = self._tags_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         data = self._lastfm_get("artist.getTopTags", artist=artist_name)
         assert data is not None
-        tags = data.get("toptags", {}).get("tag", [])
-        return [t["name"].lower() for t in tags[:limit] if t.get("name")]
+        tags_raw = data.get("toptags", {}).get("tag", [])
+        tags = [t["name"].lower() for t in tags_raw[:limit] if t.get("name")]
+
+        with self._cache_lock:
+            self._tags_cache[cache_key] = tags
+        return tags
 
     def lastfm_track_listeners(self, artist_name, track_name):
         """Fetches the listener count of a single track from Last.fm.
@@ -252,15 +486,19 @@ class SongRadio:
             found or the request failed. Results are cached per artist name
             in self._artist_stats_cache.
         """
-        if artist_name in self._artist_stats_cache:
-            return self._artist_stats_cache[artist_name]
+        with self._cache_lock:
+            if artist_name in self._artist_stats_cache:
+                return self._artist_stats_cache[artist_name]
+
         data = self._lastfm_get("artist.getInfo", artist=artist_name)
         assert data is not None
         try:
             listeners = int(data["artist"]["stats"]["listeners"])
         except (KeyError, ValueError, TypeError):
             listeners = None
-        self._artist_stats_cache[artist_name] = listeners
+
+        with self._cache_lock:
+            self._artist_stats_cache[artist_name] = listeners
         return listeners
 
     def lastfm_artist_top_track_names(self, artist_name):
@@ -275,14 +513,95 @@ class SongRadio:
             found or the request failed. Results are cached per artist name
             in self._top_tracks_cache.
         """
-        if artist_name in self._top_tracks_cache:
-            return self._top_tracks_cache[artist_name]
+        with self._cache_lock:
+            if artist_name in self._top_tracks_cache:
+                return self._top_tracks_cache[artist_name]
+
         data = self._lastfm_get("artist.getTopTracks", artist=artist_name, limit=self.artist_top_hit_exclude_n)
         assert data is not None
         tracks = data.get("toptracks", {}).get("track", [])
         names = {t["name"].lower() for t in tracks if t.get("name")}
-        self._top_tracks_cache[artist_name] = names
+
+        with self._cache_lock:
+            self._top_tracks_cache[artist_name] = names
         return names
+
+    def _fetch_artist_info_one(self, artist_name):
+        """Fetches and caches the bundle of Last.fm lookups for one artist.
+
+        Bundles the three per-artist lookups (tags, total listeners, top
+        tracks) used by filter_and_rank's cascade, and caches the bundle in
+        self._artist_info_cache so an artist is never looked up twice across
+        the whole run. Safe to call from multiple threads: each underlying
+        lookup already guards its own cache with self._cache_lock, and the
+        bundle write below does too.
+
+        Args:
+            artist_name: Name of the artist.
+
+        Returns:
+            dict with keys "tags" (set), "listeners" (int or None),
+            "top_tracks" (set).
+        """
+        with self._cache_lock:
+            cached = self._artist_info_cache.get(artist_name)
+        if cached is not None:
+            return cached
+
+        info = {
+            "tags": set(self.lastfm_top_tags(artist_name, limit=20)),
+            "listeners": self.lastfm_artist_listeners(artist_name),
+            "top_tracks": self.lastfm_artist_top_track_names(artist_name),
+        }
+
+        with self._cache_lock:
+            self._artist_info_cache[artist_name] = info
+        return info
+
+    def _fetch_artist_infos_batch(self, artist_names, max_workers):
+        """Concurrently fetches Last.fm info for a batch of artists.
+
+        Last.fm has no multi-artist "batch" endpoint, so this fires up to
+        max_workers single-artist requests concurrently rather than one at a
+        time. Artists already present in self._artist_info_cache are
+        skipped entirely (no request made, no thread spent).
+
+        Args:
+            artist_names: Iterable of artist names to fetch info for.
+            max_workers: Maximum number of concurrent requests for this
+                batch (the caller adapts this between batches based on
+                observed 429 rates).
+
+        Returns:
+            dict artist_name -> info dict (see _fetch_artist_info_one).
+            Artists whose fetch raised an exception get a safe empty-info
+            placeholder rather than being omitted, so downstream filtering
+            doesn't need special-casing for missing keys.
+        """
+        results = {}
+        to_fetch = []
+        with self._cache_lock:
+            for name in artist_names:
+                cached = self._artist_info_cache.get(name)
+                if cached is not None:
+                    results[name] = cached
+                else:
+                    to_fetch.append(name)
+
+        if not to_fetch:
+            return results
+
+        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+            future_to_name = {executor.submit(self._fetch_artist_info_one, name): name for name in to_fetch}
+            for future in as_completed(future_to_name):
+                name = future_to_name[future]
+                try:
+                    results[name] = future.result()
+                except Exception as e:
+                    logger.warning("Artist info fetch failed for %s: %s", name, e)
+                    results[name] = {"tags": set(), "listeners": None, "top_tracks": set()}
+
+        return results
 
     @lru_cache(maxsize=None)
     def is_allowed_language(self, text, allowed_languages):
@@ -406,8 +725,6 @@ class SongRadio:
 
         self.seed_genre_set = set(genre_counter)
         return artist_ids, genre_counter
-
-    RATE_LIMIT_AUTO_RETRY_THRESHOLD = 30  # seconds - above this: abort immediately instead of waiting
 
     def _load_search_cache(self):
         """Loads the persistent Spotify search cache from disk.
@@ -540,7 +857,7 @@ class SongRadio:
 
     def build_candidate_pool(self, genre_counter):
         """Gathers candidate tracks via genre and seed artist search.
- 
+
         Combines two sources, each fetched round-robin (results_per_turn new
         results per query per turn, cycling through queries) so that no
         single genre or seed artist drains its full budget before the others
@@ -552,17 +869,17 @@ class SongRadio:
         (artist, normalized title) so different versions of the same song
         don't appear multiple times, and excludes the seed tracks themselves
         as well as excluded_artists / disallowed languages.
- 
+
         Args:
             genre_counter: Counter mapping genre tag -> frequency (e.g. from
                 get_seed_artist_ids_and_genres).
- 
+
         Returns:
             List of Spotify track objects (dicts), one per unique
             (artist, normalized title) key.
         """
         candidates = {}  # dedup_key -> track
- 
+
         def add_track(track):
             if not track or not track.get("id"):
                 return
@@ -575,7 +892,7 @@ class SongRadio:
             if not self.is_allowed_language(track["name"], frozenset(self.allowed_languages)):
                 return
             candidates[key] = track
- 
+
         def fetch_round_robin(query_to_artist, per_query_cap):
             """Cycles through queries, requesting results_per_turn new
             results per query per round, until every query is exhausted or
@@ -600,16 +917,16 @@ class SongRadio:
                         add_track(track)
                     if len(results) < target or target >= per_query_cap:
                         active.discard(q)
- 
+
         # Never let the seed tracks themselves count as a "new recommendation"
         for seed_track in self.seed_tracks:
             key = (seed_track["artists"][0]["name"].lower(), self.normalize_title(seed_track["name"]))
             candidates[key] = None  # placeholder, filtered out below
- 
+
         # 1) Genre search for diversity across other artists
         blocklist = self.LASTFM_JUNK_TAGS | self.excluded_genres
         specific_genres = [g for g in genre_counter if g not in blocklist]
-        specific_genres.sort(key=lambda g: (-len(g.split()), -genre_counter[g]))
+        specific_genres.sort(key=lambda g: (-g.count(" "), -genre_counter[g]))
         pool_size = min(len(specific_genres), self.genres_to_use * self.genre_pool_multiplier)
         genre_pool = specific_genres[:pool_size]
         if genre_pool:
@@ -617,19 +934,19 @@ class SongRadio:
         else:
             top_genres = [g for g, _ in genre_counter.most_common(self.genres_to_use)] or ["pop"]
         print(f"Genres used: {top_genres}")
- 
+
         fetch_round_robin(
             {f'genre:"{g}"': None for g in top_genres},
             self.max_results_per_genre,
         )
- 
+
         # 2) Targeted search for the seed artists, to weight their catalog
         #    (deep cuts) more heavily
         fetch_round_robin(
             {f'artist:"{a}"': a for a in self.seed_artist_names},
             self.max_results_per_seed_artist,
         )
- 
+
         candidates.pop(None, None)
         return [t for t in candidates.values() if t is not None]
 
@@ -645,67 +962,146 @@ class SongRadio:
         """
         if not self.seed_genre_set or not artist_tags:
             return 0.0
-        union = self.seed_genre_set | artist_tags
-        if not union:
-            return 0.0
-        return len(self.seed_genre_set & artist_tags) / len(union)
-
-    MIN_TRACK_DURATION_MS = 60_000  # tracks shorter than this are filtered out by default
+        intersection = self.seed_genre_set & artist_tags
+        union_size = len(self.seed_genre_set) + len(artist_tags) - len(intersection)
+        return len(intersection) / union_size if union_size else 0.0
 
     def filter_and_rank(self, candidates):
+        """Filters candidates and ranks them by genre similarity to the seeds.
+
+        Filter cascade per candidate (same as before):
+            1. Track duration > MIN_TRACK_DURATION_MS (no data needed, cheapest check first).
+            2. Last.fm genre tags against excluded_genres.
+            3. Artist's total listeners >= min_artist_listeners (lower bound
+               only, large artists are allowed as long as the song itself is obscure).
+            4. Track is not one of the artist's top hits.
+            5. Track listener count <= lastfm_listener_ceiling.
+            6. Track listener count >= min_track_listeners.
+
+        Instead of stopping at the first result_limit passing candidates,
+        gathers up to result_limit * similarity_oversample_factor of them,
+        scores each by Jaccard similarity (see _genre_similarity) between its
+        artist's Last.fm tags and self.seed_genre_set, and keeps the
+        result_limit most similar ones.
+
+        Candidates are processed in windowed batches (self.lastfm_batch_size
+        tracks at a time) rather than one at a time or all at once: within a
+        batch, Last.fm lookups run concurrently (self.lastfm_max_workers
+        ceiling, adaptively reduced if 429s are observed - see
+        LastFmRequestMonitor), but the early-stop check still runs between
+        batches, so gathering stops as soon as oversample_target passing
+        candidates are found. This trades a small, bounded overfetch (up to
+        one batch's worth of extra lookups) for concurrency within each
+        batch - a fixed one-at-a-time loop can't be parallelized without
+        losing the early-stop property entirely.
+
+        Args:
+            candidates: List of Spotify track objects (dicts), e.g. from
+                build_candidate_pool.
+
+        Returns:
+            List of dicts with the keys "track" (Spotify track object),
+            "track_listeners" (int or None), "artist_listeners" (int or
+            None), and "similarity" (float in [0, 1]). At most
+            self.result_limit entries, sorted by similarity descending. Also
+            stored in self.picks.
+        """
         pool = list(candidates)
         random.shuffle(pool)
 
         oversample_target = self.result_limit * self.similarity_oversample_factor
         scored = []
-        artist_cache = {}  # artist_name -> dict of cached lookups
 
-        def get_artist_info(artist_name):
-            if artist_name not in artist_cache:
-                artist_cache[artist_name] = {
-                    "tags": set(self.lastfm_top_tags(artist_name, limit=20)),
-                    "listeners": self.lastfm_artist_listeners(artist_name),
-                    "top_tracks": self.lastfm_artist_top_track_names(artist_name),
-                }
-            return artist_cache[artist_name]
+        workers = self.lastfm_max_workers  # adaptive: shrinks/grows between batches
+        batch_size = self.lastfm_batch_size
+        consecutive_clean_batches = 0
 
-        for track in pool:
-            if len(scored) >= oversample_target:
-                break
+        i = 0
+        while i < len(pool) and len(scored) < oversample_target:
+            batch = pool[i : i + batch_size]
+            i += batch_size
 
-            if track.get("duration_ms", 0) <= self.MIN_TRACK_DURATION_MS:
+            # Cheap, sequential pre-filter: no network call needed.
+            batch = [t for t in batch if t.get("duration_ms", 0) > self.MIN_TRACK_DURATION_MS]
+            if not batch:
                 continue
 
-            artist_name = track["artists"][0]["name"]
-            track_name = track["name"]
+            unique_artists = {t["artists"][0]["name"] for t in batch}
+            artist_infos = self._fetch_artist_infos_batch(unique_artists, max_workers=workers)
 
-            info = get_artist_info(artist_name)
+            # Artist-level filters first (cheap, no extra request) to avoid
+            # spending a track.getInfo request on a track whose artist would
+            # be excluded anyway.
+            survivors = []
+            for track in batch:
+                artist_name = track["artists"][0]["name"]
+                info = artist_infos.get(artist_name, {"tags": set(), "listeners": None, "top_tracks": set()})
 
-            if self.excluded_genres and info["tags"] & self.excluded_genres:
-                continue
-            if info["listeners"] is not None and info["listeners"] < self.min_artist_listeners:
-                continue
-            if track_name.lower() in info["top_tracks"]:
-                continue
+                if self.excluded_genres and info["tags"] & self.excluded_genres:
+                    continue
+                if info["listeners"] is not None and info["listeners"] < self.min_artist_listeners:
+                    continue
+                if track["name"].lower() in info["top_tracks"]:
+                    continue
+                survivors.append((track, info))
 
-            track_listeners = self.lastfm_track_listeners(artist_name, track_name)
-            if track_listeners is not None and track_listeners > self.lastfm_listener_ceiling:
-                continue
-            if track_listeners is not None and track_listeners < self.min_track_listeners:
-                continue
+            track_listener_results = {}
+            if survivors:
+                with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+                    future_to_idx = {
+                        executor.submit(self.lastfm_track_listeners, t["artists"][0]["name"], t["name"]): idx
+                        for idx, (t, _info) in enumerate(survivors)
+                    }
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        try:
+                            track_listener_results[idx] = future.result()
+                        except Exception as e:
+                            logger.warning("Track listener fetch failed: %s", e)
+                            track_listener_results[idx] = None
 
-            similarity = self._genre_similarity(info["tags"])
-            scored.append({
-                "track": track,
-                "track_listeners": track_listeners,
-                "artist_listeners": info["listeners"],
-                "similarity": similarity,
-            })
+            for idx, (track, info) in enumerate(survivors):
+                if len(scored) >= oversample_target:
+                    break
+
+                track_listeners = track_listener_results.get(idx)
+                if track_listeners is not None and track_listeners > self.lastfm_listener_ceiling:
+                    continue
+                if track_listeners is not None and track_listeners < self.min_track_listeners:
+                    continue
+
+                similarity = self._genre_similarity(info["tags"])
+                scored.append({
+                    "track": track,
+                    "track_listeners": track_listeners,
+                    "artist_listeners": info["listeners"],
+                    "similarity": similarity,
+                })
+
+            # Adaptive concurrency: back off hard if this batch saw
+            # meaningful 429s, and only cautiously ramp back up after a run
+            # of clean batches (additive increase / multiplicative decrease).
+            throttle_rate = self._lastfm_monitor.recent_throttle_rate
+            if throttle_rate >= self._lastfm_monitor.throttle_rate_alert:
+                workers = max(1, workers // 2)
+                cooldown = min(30, self.lastfm_backoff_base * (2 ** (self.lastfm_max_workers - workers)))
+                logger.warning(
+                    "Backing off Last.fm concurrency to %d worker(s), cooling down %.1fs.", workers, cooldown,
+                )
+                time.sleep(cooldown)
+                consecutive_clean_batches = 0
+            else:
+                consecutive_clean_batches += 1
+                if consecutive_clean_batches >= 3 and workers < self.lastfm_max_workers:
+                    workers += 1
+                    consecutive_clean_batches = 0
 
         scored.sort(key=lambda p: p["similarity"], reverse=True)
         picks = scored[: self.result_limit]
+
         if len(picks) < self.result_limit:
             print(f"Note: Only {len(picks)} matching tracks found (out of {len(pool)} candidates).")
+
         self.picks = picks
         return picks
 

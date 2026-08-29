@@ -1,19 +1,44 @@
-import cProfile
-import pstats
+import argparse
+import json
+import logging
+
+
+def load_config():
+    """Loads config.json, falling back to config_template.json if absent.
+
+    Args:
+        None.
+
+    Returns:
+        dict: the parsed configuration.
+
+    Raises:
+        RuntimeError: if neither file exists, or if the file that does exist
+            contains invalid JSON.
+    """
+    try:
+        with open("config.json", "r") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        pass
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"config.json exists but is not valid JSON: {e}")
+
+    try:
+        with open("config_template.json", "r") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "Could not find 'config.json' or 'config_template.json' in this directory."
+        )
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"config_template.json exists but is not valid JSON: {e}")
+
 
 def main():
     from SongRadio import SongRadio
-    import json
 
-    try:
-        with open("config.json", "r") as file:
-            config = json.load(file)
-    except FileNotFoundError:
-        with open("config_template.json", "r") as file:
-            config = json.load(file)
-    except:
-        raise RuntimeError("Could not resolve config from file. Please ensure either 'config.json' or 'config_template.json' exists in this directory.")
-
+    config = load_config()
     radio = SongRadio(**config)
 
     print("Resolving seed tracks...")
@@ -42,12 +67,71 @@ def main():
     else:
         print("Playlist will not be saved.")
 
-if __name__ == "__main__":
+
+def run_with_cprofile():
+    """Runs main() under cProfile.
+
+    Note: cProfile only instruments the thread it's enabled on. Calls made
+    inside SongRadio's ThreadPoolExecutor workers (the concurrent Last.fm
+    lookups in filter_and_rank) will NOT be attributed here - this profile
+    is only reliable for everything that still runs single-threaded
+    (Spotify search/pagination, language detection, dedup, etc). Use
+    run_with_yappi() for a profile that includes the worker threads.
+    """
+    import cProfile
+    import pstats
+
     profiler = cProfile.Profile()
     profiler.enable()
-    main()
-    profiler.disable()
+    try:
+        main()
+    finally:
+        profiler.disable()
+        stats = pstats.Stats(profiler)
+        stats.sort_stats("ncalls").print_stats(20)
+        stats.sort_stats("cumulative").print_stats(20)
 
-    stats = pstats.Stats(profiler)
-    stats.sort_stats("ncalls").print_stats(20)      # most-called functions
-    stats.sort_stats("cumulative").print_stats(20)  # where time is actually spent
+
+def run_with_yappi():
+    """Runs main() under yappi, which (unlike cProfile) tracks time across threads.
+
+    Requires `pip install yappi`. Reports wall-clock time so that time spent
+    blocked on network I/O in worker threads is visible.
+    """
+    import yappi
+
+    yappi.set_clock_type("wall")
+    yappi.start()
+    try:
+        main()
+    finally:
+        yappi.stop()
+        stats = yappi.get_func_stats()
+        stats.sort("ttot", "desc")
+        stats.print_all(columns={0: ("name", 80), 1: ("ncall", 10), 2: ("tsub", 8), 3: ("ttot", 8)})
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Song Radio (Low-Mainstream Edition)")
+    parser.add_argument("--profile", action="store_true", help="Profile with cProfile (main thread only).")
+    parser.add_argument(
+        "--profile-threads", action="store_true",
+        help="Profile with yappi, including worker-thread time (requires `pip install yappi`).",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Show INFO-level logs (Last.fm request counts), not just warnings/alerts.",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    if args.profile_threads:
+        run_with_yappi()
+    elif args.profile:
+        run_with_cprofile()
+    else:
+        main()
