@@ -58,18 +58,31 @@ class LastFmRequestMonitor:
     clean requests earlier in the run.
     """
 
-    def __init__(self, api_key, window_size=40, error_rate_alert=0.3, throttle_rate_alert=0.15):
+    def __init__(
+        self, api_key, window_size=40, error_rate_alert=0.3, throttle_rate_alert=0.15,
+        latency_alert_multiplier=2.0, baseline_sample_size=20,
+    ):
         """Initializes the monitor.
 
         Args:
             api_key: The Last.fm API key being monitored (only its last 4
                 characters are ever logged, to avoid leaking the key).
             window_size: Number of most recent outcomes considered when
-                computing rolling error/throttle rates.
+                computing rolling error/throttle rates and recent latency.
             error_rate_alert: Rolling error rate (network errors, 5xx) at or
                 above which an alert is logged.
             throttle_rate_alert: Rolling 429 rate at or above which an alert
                 is logged and the caller is expected to reduce concurrency.
+            latency_alert_multiplier: How many times slower than the
+                established baseline the recent median response latency
+                must become before an alert is logged. This is meant to
+                catch server-side slowdown under load even when it never
+                escalates to an outright 429 - Last.fm has no documented
+                rate limit, so quietly getting slower is a plausible first
+                symptom of approaching one.
+            baseline_sample_size: Number of early, presumably-uncontended
+                requests used to establish the "normal" latency baseline
+                against which later slowdowns are measured.
 
         Returns:
             None.
@@ -78,19 +91,32 @@ class LastFmRequestMonitor:
         self.window_size = window_size
         self.error_rate_alert = error_rate_alert
         self.throttle_rate_alert = throttle_rate_alert
-        self._lock = threading.Lock()
+        self.latency_alert_multiplier = latency_alert_multiplier
+        # Reentrant: summary() calls recent_median_latency while already
+        # holding the lock, which a plain Lock would deadlock on.
+        self._lock = threading.RLock()
         self._outcomes = deque(maxlen=window_size)  # "ok" | "error" | "throttled"
+        self._latencies = deque(maxlen=window_size)  # seconds, successful requests only
+        self._baseline_samples = []
+        self._baseline_sample_size = baseline_sample_size
+        self.baseline_latency = None  # set once, from the first baseline_sample_size successes
         self.total_requests = 0
         self.total_errors = 0
         self.total_throttled = 0
         self._alerted_error = False
         self._alerted_throttle = False
+        self._alerted_latency = False
 
-    def record(self, outcome):
+    def record(self, outcome, latency=None):
         """Records a single request outcome and logs alerts if thresholds are crossed.
 
         Args:
             outcome: One of "ok", "error", "throttled".
+            latency: Response time in seconds, for successful ("ok")
+                requests only. Errors/timeouts are excluded from latency
+                tracking since their duration reflects the failure mode
+                (e.g. a 5s connect timeout) rather than genuine server
+                responsiveness, which would badly skew the baseline.
 
         Returns:
             None.
@@ -103,36 +129,71 @@ class LastFmRequestMonitor:
                 self.total_throttled += 1
             self._outcomes.append(outcome)
 
+            if latency is not None and outcome == "ok":
+                if self.baseline_latency is None:
+                    self._baseline_samples.append(latency)
+                    if len(self._baseline_samples) >= self._baseline_sample_size:
+                        ordered = sorted(self._baseline_samples)
+                        self.baseline_latency = ordered[len(ordered) // 2]  # median
+                        logger.info(
+                            "Last.fm key ...%s: baseline latency established at %.3fs.",
+                            self.api_key[-4:], self.baseline_latency,
+                        )
+                self._latencies.append(latency)
+
             if self.total_requests % 25 == 0:
+                latency_note = (
+                    f", recent median latency {self.recent_median_latency:.3f}s"
+                    f" (baseline {self.baseline_latency:.3f}s)"
+                    if self.baseline_latency is not None else ""
+                )
                 logger.info(
-                    "Last.fm key ...%s: %d requests so far (%d errors, %d throttled).",
+                    "Last.fm key ...%s: %d requests so far (%d errors, %d throttled)%s.",
                     self.api_key[-4:], self.total_requests, self.total_errors, self.total_throttled,
+                    latency_note,
                 )
 
-            if len(self._outcomes) < self.window_size:
-                return
+            if len(self._outcomes) >= self.window_size:
+                error_rate = sum(1 for o in self._outcomes if o == "error") / len(self._outcomes)
+                throttle_rate = sum(1 for o in self._outcomes if o == "throttled") / len(self._outcomes)
 
-            error_rate = sum(1 for o in self._outcomes if o == "error") / len(self._outcomes)
-            throttle_rate = sum(1 for o in self._outcomes if o == "throttled") / len(self._outcomes)
+                if error_rate >= self.error_rate_alert and not self._alerted_error:
+                    logger.warning(
+                        "ALERT: Last.fm error rate %.0f%% over the last %d requests (key ...%s).",
+                        error_rate * 100, self.window_size, self.api_key[-4:],
+                    )
+                    self._alerted_error = True
+                elif error_rate < self.error_rate_alert * 0.5:
+                    self._alerted_error = False  # recovered; allow re-alerting if it climbs again
 
-            if error_rate >= self.error_rate_alert and not self._alerted_error:
-                logger.warning(
-                    "ALERT: Last.fm error rate %.0f%% over the last %d requests (key ...%s).",
-                    error_rate * 100, self.window_size, self.api_key[-4:],
-                )
-                self._alerted_error = True
-            elif error_rate < self.error_rate_alert * 0.5:
-                self._alerted_error = False  # recovered; allow re-alerting if it climbs again
+                if throttle_rate >= self.throttle_rate_alert and not self._alerted_throttle:
+                    logger.warning(
+                        "ALERT: Last.fm 429 rate %.0f%% over the last %d requests (key ...%s) "
+                        "- concurrency should be reduced.",
+                        throttle_rate * 100, self.window_size, self.api_key[-4:],
+                    )
+                    self._alerted_throttle = True
+                elif throttle_rate < self.throttle_rate_alert * 0.5:
+                    self._alerted_throttle = False
 
-            if throttle_rate >= self.throttle_rate_alert and not self._alerted_throttle:
-                logger.warning(
-                    "ALERT: Last.fm 429 rate %.0f%% over the last %d requests (key ...%s) "
-                    "- concurrency should be reduced.",
-                    throttle_rate * 100, self.window_size, self.api_key[-4:],
-                )
-                self._alerted_throttle = True
-            elif throttle_rate < self.throttle_rate_alert * 0.5:
-                self._alerted_throttle = False
+            # Latency alert: a rolling window is used here too (rather than
+            # requiring it to be full of "ok" outcomes) so a real slowdown
+            # is caught even if the window is being diluted by unrelated
+            # errors/throttles that don't themselves carry a latency value.
+            if self.baseline_latency is not None and len(self._latencies) >= min(10, self.window_size):
+                ordered = sorted(self._latencies)
+                recent_median = ordered[len(ordered) // 2]
+                slowdown_threshold = self.baseline_latency * self.latency_alert_multiplier
+
+                if recent_median >= slowdown_threshold and not self._alerted_latency:
+                    logger.warning(
+                        "ALERT: Last.fm response latency has risen to %.3fs (baseline %.3fs, key ...%s) "
+                        "- this can be a silent precursor to throttling even with no 429s seen.",
+                        recent_median, self.baseline_latency, self.api_key[-4:],
+                    )
+                    self._alerted_latency = True
+                elif recent_median < slowdown_threshold * 0.7:
+                    self._alerted_latency = False  # recovered; allow re-alerting if it climbs again
 
     @property
     def recent_throttle_rate(self):
@@ -149,6 +210,48 @@ class LastFmRequestMonitor:
             if not self._outcomes:
                 return 0.0
             return sum(1 for o in self._outcomes if o == "throttled") / len(self._outcomes)
+
+    @property
+    def recent_median_latency(self):
+        """Median response latency (seconds) over the current rolling window.
+
+        Args:
+            None.
+
+        Returns:
+            Float, or None if no successful requests have been recorded yet.
+        """
+        with self._lock:
+            if not self._latencies:
+                return None
+            ordered = sorted(self._latencies)
+            return ordered[len(ordered) // 2]
+
+    def summary(self):
+        """Human-readable one-line summary of request health for this run.
+
+        Intended to be printed at the end of a run as an explicit check,
+        rather than relying solely on alerts having fired mid-run.
+
+        Args:
+            None.
+
+        Returns:
+            str.
+        """
+        with self._lock:
+            baseline = f"{self.baseline_latency:.3f}s" if self.baseline_latency is not None else "n/a"
+            recent = self.recent_median_latency
+            recent_str = f"{recent:.3f}s" if recent is not None else "n/a"
+            drift = ""
+            if self.baseline_latency is not None and recent is not None:
+                ratio = recent / self.baseline_latency
+                drift = f" ({ratio:.1f}x baseline)"
+            return (
+                f"Last.fm key ...{self.api_key[-4:]}: {self.total_requests} requests total, "
+                f"{self.total_errors} errors, {self.total_throttled} throttled (429). "
+                f"Latency baseline {baseline}, recent median {recent_str}{drift}."
+            )
 
 
 class SongRadio:
@@ -203,13 +306,15 @@ class SongRadio:
         genre_pool_multiplier: int = 2,
         min_track_listeners: int = 0,
         similarity_oversample_factor: int = 3,
-        lastfm_max_workers: int = 4,
-        lastfm_batch_size: int = 12,
+        lastfm_max_workers: int = 12,
+        lastfm_batch_size: int = 36,
         lastfm_max_retries: int = 4,
         lastfm_backoff_base: float = 1.0,
         lastfm_throttle_rate_alert: float = 0.15,
         lastfm_error_rate_alert: float = 0.3,
         lastfm_monitor_window: int = 40,
+        lastfm_latency_alert_multiplier: float = 2.0,
+        lastfm_baseline_sample_size: int = 20,
     ):
         """Initializes the Spotify/Last.fm clients and stores the configuration.
 
@@ -283,7 +388,15 @@ class SongRadio:
             lastfm_error_rate_alert: Rolling network/5xx error rate at or
                 above which an alert is logged.
             lastfm_monitor_window: Number of most recent Last.fm requests
-                considered when computing rolling error/429 rates.
+                considered when computing rolling error/429 rates and
+                recent latency.
+            lastfm_latency_alert_multiplier: How many times slower than the
+                established baseline the recent median response latency
+                must become before an alert is logged (see
+                LastFmRequestMonitor). Catches server-side slowdown even
+                when it never escalates to an outright 429.
+            lastfm_baseline_sample_size: Number of early requests used to
+                establish the "normal" latency baseline.
 
         Returns:
             None.
@@ -345,7 +458,25 @@ class SongRadio:
             window_size=lastfm_monitor_window,
             error_rate_alert=lastfm_error_rate_alert,
             throttle_rate_alert=lastfm_throttle_rate_alert,
+            latency_alert_multiplier=lastfm_latency_alert_multiplier,
+            baseline_sample_size=lastfm_baseline_sample_size,
         )
+
+    def lastfm_health_summary(self):
+        """Human-readable summary of Last.fm request health for this run.
+
+        Prints total requests/errors/429s and how the recent median
+        response latency compares to the baseline established early in the
+        run - an explicit, always-available check for server-side
+        slowdown, rather than relying solely on alerts having fired.
+
+        Args:
+            None.
+
+        Returns:
+            str.
+        """
+        return self._lastfm_monitor.summary()
 
     # --- Last.fm helpers -----------------------------------------------
 
@@ -374,6 +505,7 @@ class SongRadio:
 
         for attempt in range(max_attempts):
             is_last_attempt = attempt == max_attempts - 1
+            request_start = time.monotonic()
 
             try:
                 resp = requests.get(
@@ -424,7 +556,8 @@ class SongRadio:
                 logger.warning("Last.fm response for %s was not valid JSON: %s", method, e)
                 return {}
 
-            self._lastfm_monitor.record("ok")
+            elapsed = time.monotonic() - request_start
+            self._lastfm_monitor.record("ok", latency=elapsed)
             return data
 
         return {}
@@ -1186,7 +1319,7 @@ class SongRadio:
             n += 1
         return f"{base_name} #{n}"
 
-    def save_as_playlist(self, base_name="Song Radio (Low-Mainstream)"):
+    def save_as_playlist(self, base_name="Song Radio"):
         """Creates a private playlist with the recommendations (+ optionally seeds).
 
         Uses raw HTTP requests instead of spotipy methods for creation and

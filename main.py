@@ -1,3 +1,6 @@
+# notes:
+# introduce 
+
 import argparse
 import json
 import logging
