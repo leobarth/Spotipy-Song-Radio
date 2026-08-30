@@ -4,9 +4,7 @@
     "redirect_uri": "ADD_YOURS",
     "lastfm_api_key": "ADD_YOURS",
     "seed_queries": {
-        "Stevie Wonder": "Superstition",
-        "Red Hot Chili Peppers": "Easily",
-        "Men At Work": "Underground"
+        "Some Artist": "Some Song/Track"
     },
     "include_seed_tracks": true,
     "result_limit": 15,
