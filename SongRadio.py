@@ -1475,14 +1475,15 @@ class SongRadio:
             with a number appended.
         """
         existing = self._existing_playlist_names()
-        if base_name not in existing:
-            return base_name
+        name = f"{next(iter(self.seed_queries.values()))}: {base_name}"
+        if name not in existing:
+            return name
         n = 2
-        while f"{base_name} #{n}" in existing:
+        while f"{name} #{n}" in existing:
             n += 1
-        return f"{base_name} #{n}"
+        return f"{name} #{n}"
 
-    def save_as_playlist(self, base_name="Song Radio (Low-Mainstream)"):
+    def save_as_playlist(self, base_name="Song Radio"):
         """Creates a private playlist with the recommendations (+ optionally seeds).
 
         Uses raw HTTP requests instead of spotipy methods for creation and
