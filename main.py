@@ -1,8 +1,3 @@
-# notes:
-# exploration factor for candidate building
-# ensure the max candidate limit is reached
-# all in all fix candidate building
-
 import argparse
 import json
 import logging

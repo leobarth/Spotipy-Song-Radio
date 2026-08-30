@@ -284,29 +284,38 @@ class SongRadio:
 
     def __init__(
         self,
+        # --- Spotify / Last.fm connection ---
         client_id: str,
         client_secret: str,
         redirect_uri: str,
         lastfm_api_key: str,
+        # --- Seed configuration ---
         seed_queries: dict,
+        include_seed_tracks: bool = True,
+        # --- Output shaping ---
         result_limit: int = 15,
+        similarity_oversample_factor: int = 3,
+        # --- Candidate gathering ---
         genres_to_use: int = 5,
+        genre_pool_multiplier: int = 2,
+        results_per_turn: int = 10,
+        max_results_per_genre: int = 300,
+        max_results_per_seed_artist: int = 200,
+        target_total_candidates: int = 150,
+        min_fresh_fraction: float = 0.2,
+        max_candidate_expansion_rounds: int = 5,
+        # --- Filtering thresholds ---
         min_artist_listeners: int = 1_000,
         lastfm_listener_ceiling: int = 150_000,
+        min_track_listeners: int = 0,
         artist_top_hit_exclude_n: int = 5,
         allowed_languages: list = ["en", "de"],
         excluded_artists: list = [],
         excluded_genres: list = [],
-        results_per_turn: int = 10,
-        max_results_per_genre: int = 300,
-        max_results_per_seed_artist: int = 200,
-        max_total_candidates: int = 150,
-        include_seed_tracks: bool = True,
+        # --- Local Spotify search cache ---
         cache_path: str = "spotify_search_cache.json",
         cache_ttl_days: float = 30,
-        genre_pool_multiplier: int = 2,
-        min_track_listeners: int = 0,
-        similarity_oversample_factor: int = 3,
+        # --- Last.fm concurrency / resilience ---
         lastfm_max_workers: int = 4,
         lastfm_batch_size: int = 12,
         lastfm_max_retries: int = 4,
@@ -326,13 +335,49 @@ class SongRadio:
             lastfm_api_key: Last.fm API key (genre/listener count data).
             seed_queries: Mapping {artist name: song title} used as the
                 starting point for the recommendations.
+            include_seed_tracks: Whether the seed tracks themselves should be
+                included in the playlist created later.
             result_limit: Number of tracks returned at the end.
+            similarity_oversample_factor: How many times result_limit worth
+                of filter-passing candidates to gather before ranking by
+                genre similarity to the seeds and keeping the best
+                result_limit. Higher values give better similarity ranking
+                at the cost of more Last.fm requests.
             genres_to_use: Number of (most specific) genres used for the
-                genre search.
+                genre search, per round.
+            genre_pool_multiplier: Widens the genre candidate pool to
+                genres_to_use * genre_pool_multiplier before randomly
+                sampling genres_to_use from it, so the same seeds don't
+                always search the exact same genres every run.
+            results_per_turn: Results requested per query per round-robin
+                turn (see build_candidate_pool).
+            max_results_per_genre: Upper bound on search results per genre query.
+            max_results_per_seed_artist: Upper bound on search results per
+                seed artist query.
+            target_total_candidates: Desired candidate pool size.
+                build_candidate_pool treats this as a target to actively
+                work toward - if the initial genre/seed-artist search comes
+                up short, additional not-yet-tried genres are queried (up
+                to max_candidate_expansion_rounds) before giving up and
+                reporting a genuine shortfall.
+            min_fresh_fraction: Minimum fraction (0-1) of the final
+                candidate pool that must come from tracks fetched live from
+                Spotify this run, as opposed to replayed from the local
+                search cache. If the initial search comes in under this,
+                additional not-yet-tried genres are queried (subject to the
+                same max_candidate_expansion_rounds budget) to raise it.
+            max_candidate_expansion_rounds: Safety cap on how many extra
+                genre-search rounds build_candidate_pool will run while
+                trying to reach target_total_candidates / min_fresh_fraction,
+                so a persistently thin genre neighborhood can't loop
+                indefinitely.
             min_artist_listeners: Minimum total listener count an artist must
                 have on Last.fm to be considered a candidate.
             lastfm_listener_ceiling: Maximum listener count a single track may
                 have on Last.fm to still count as a "hidden gem".
+            min_track_listeners: Minimum Last.fm listener count a single
+                track must have to be considered (filters out tracks with
+                barely any listeners). 0 disables this floor.
             artist_top_hit_exclude_n: Number of an artist's most-listened
                 tracks that count as "used up" and get excluded.
             allowed_languages: Set of allowed language codes (e.g. "en", "de")
@@ -340,13 +385,6 @@ class SongRadio:
             excluded_artists: Artist names that should never appear as candidates.
             excluded_genres: Genre tags that should never be used as a search
                 term and whose artists get hard-excluded.
-            max_results_per_genre: Upper bound on search results per genre query.
-            max_results_per_seed_artist: Upper bound on search results per
-                seed artist query.
-            max_total_candidates: Overall candidate cap at which candidate
-                gathering is stopped early.
-            include_seed_tracks: Whether the seed tracks themselves should be
-                included in the playlist created later.
             cache_path: Path to the local JSON file used to persist Spotify
                 search results across runs, so identical queries don't
                 re-fetch already-seen offsets and instead explore new ones.
@@ -354,18 +392,6 @@ class SongRadio:
                 state (offsets_fetched/exhausted) is reset so it gets
                 re-scanned from offset 0, to catch drift in Spotify's ranking.
                 Set to 0 to disable expiration entirely.
-            genre_pool_multiplier: Widens the genre candidate pool to
-                genres_to_use * genre_pool_multiplier before randomly
-                sampling genres_to_use from it, so the same seeds don't
-                always search the exact same genres every run.
-            min_track_listeners: Minimum Last.fm listener count a single
-                track must have to be considered (filters out tracks with
-                barely any listeners). 0 disables this floor.
-            similarity_oversample_factor: How many times result_limit worth
-                of filter-passing candidates to gather before ranking by
-                genre similarity to the seeds and keeping the best
-                result_limit. Higher values give better similarity ranking
-                at the cost of more Last.fm requests.
             lastfm_max_workers: Maximum number of concurrent Last.fm requests
                 in a batch. This is a ceiling, not a fixed value - the
                 effective concurrency adapts downward if 429s are observed
@@ -402,6 +428,7 @@ class SongRadio:
         Returns:
             None.
         """
+        # --- Spotify / Last.fm connection ---
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyOAuth(
                 client_id=client_id,
@@ -413,43 +440,54 @@ class SongRadio:
             requests_timeout=10,
         )
         self.lastfm_api_key = lastfm_api_key
+
+        # --- Seed configuration ---
         self.seed_queries = seed_queries
+        self.include_seed_tracks = include_seed_tracks
+        self.seed_tracks = []  # full track objects, for playlist inclusion
+        self.seed_artist_names = []
+        self.seed_genre_set = set()  # populated by get_seed_artist_ids_and_genres
+
+        # --- Output shaping ---
         self.result_limit = result_limit
+        self.similarity_oversample_factor = similarity_oversample_factor
+        self.picks = []
+
+        # --- Candidate gathering ---
         self.genres_to_use = genres_to_use
+        self.genre_pool_multiplier = genre_pool_multiplier
+        self.results_per_turn = results_per_turn
+        self.max_results_per_genre = max_results_per_genre
+        self.max_results_per_seed_artist = max_results_per_seed_artist
+        self.target_total_candidates = target_total_candidates
+        self.min_fresh_fraction = min_fresh_fraction
+        self.max_candidate_expansion_rounds = max_candidate_expansion_rounds
+
+        # --- Filtering thresholds ---
         self.min_artist_listeners = min_artist_listeners
         self.lastfm_listener_ceiling = lastfm_listener_ceiling
+        self.min_track_listeners = min_track_listeners
         self.artist_top_hit_exclude_n = artist_top_hit_exclude_n
         self.allowed_languages = set(allowed_languages)
         self.excluded_artists = {a.lower() for a in excluded_artists}
         self.excluded_genres = {g.lower() for g in excluded_genres}
-        self.results_per_turn = results_per_turn
-        self.max_results_per_genre = max_results_per_genre
-        self.max_results_per_seed_artist = max_results_per_seed_artist
-        self.max_total_candidates = max_total_candidates
-        self.include_seed_tracks = include_seed_tracks
 
+        # --- Local Spotify search cache ---
+        self.cache_path = cache_path
+        self.cache_ttl_days = cache_ttl_days
+        self._search_cache = self._load_search_cache()
         self.search_limit = 10  # Spotify maximum since Feb 2026
         self.request_sleep = 0.2  # a bit generous, to avoid bursts
         self._max_offset = 990  # safety cap for offset pagination
 
+        # --- Last.fm-side lookup caches (artist tags/listeners/top-tracks) ---
         self._artist_stats_cache = {}
         self._top_tracks_cache = {}
         self._tags_cache = {}
         self._artist_info_cache = {}
         self._cache_lock = threading.Lock()
 
-        self.seed_tracks = []  # full track objects, for playlist inclusion
-        self.seed_artist_names = []
-        self.picks = []
-
-        self.cache_path = cache_path
-        self._search_cache = self._load_search_cache()
-        self.cache_ttl_days = cache_ttl_days
-        self.genre_pool_multiplier = genre_pool_multiplier
-        self.min_track_listeners = min_track_listeners
-        self.similarity_oversample_factor = similarity_oversample_factor
-        self.seed_genre_set = set()  # populated by get_seed_artist_ids_and_genres
-
+        # --- Last.fm concurrency / resilience ---
         self.lastfm_max_workers = lastfm_max_workers
         self.lastfm_batch_size = lastfm_batch_size
         self.lastfm_max_retries = lastfm_max_retries
@@ -940,7 +978,7 @@ class SongRadio:
         with open(self.cache_path, "w") as f:
             json.dump(self._search_cache, f)
 
-    def _paginated_search(self, query, max_results):
+    def _paginated_search(self, query, max_results, fresh_ids=None):
         """Pages through Spotify search results via offset.
 
         Increases offset in steps of self.search_limit until either
@@ -964,6 +1002,11 @@ class SongRadio:
             query: Spotify search query (e.g. 'genre:"funk rock"').
             max_results: Upper bound on results collected for this query
                 (cached + newly fetched).
+            fresh_ids: Optional set that track IDs get added to when they're
+                obtained via a live Spotify request in this call, as opposed
+                to being replayed from the cache's existing track_ids. Lets
+                a caller measure what fraction of a candidate pool came from
+                genuinely new requests this run (see build_candidate_pool).
 
         Returns:
             List of Spotify track objects (dicts).
@@ -1035,6 +1078,8 @@ class SongRadio:
                     if track["id"] not in entry["track_ids"]:
                         entry["track_ids"].append(track["id"])
                     collected.append(track)
+                    if fresh_ids is not None:
+                        fresh_ids.add(track["id"])  # obtained via a live request, not the cache replay above
             self._save_search_cache()  # persist after every offset, not just at the end
             offset += self.search_limit
         return collected
@@ -1054,6 +1099,19 @@ class SongRadio:
         don't appear multiple times, and excludes the seed tracks themselves
         as well as excluded_artists / disallowed languages.
 
+        target_total_candidates and min_fresh_fraction are treated as goals
+        to actively work toward rather than passive caps: when sampling
+        genres, not-yet-exhausted ones (see self._search_cache) are
+        preferred over ones already known to have no more Spotify results
+        left, since a query that can only replay cached data can't help
+        either goal. If the initial round still falls short of either
+        target, additional not-yet-tried genres are queried in further
+        rounds - each of which necessarily pulls live, fresh results, since
+        a genre only gets picked here if it hasn't been queried yet this run
+        - up to max_candidate_expansion_rounds, after which a genuine
+        shortfall is reported rather than silently returned as if nothing
+        were missing.
+
         Args:
             genre_counter: Counter mapping genre tag -> frequency (e.g. from
                 get_seed_artist_ids_and_genres).
@@ -1063,6 +1121,7 @@ class SongRadio:
             (artist, normalized title) key.
         """
         candidates = {}  # dedup_key -> track
+        fresh_track_ids = set()  # track IDs obtained via a live Spotify request this run
 
         def add_track(track):
             if not track or not track.get("id"):
@@ -1080,19 +1139,19 @@ class SongRadio:
         def fetch_round_robin(query_to_artist, per_query_cap):
             """Cycles through queries, requesting results_per_turn new
             results per query per round, until every query is exhausted or
-            at its per_query_cap, or max_total_candidates is reached."""
+            at its per_query_cap, or target_total_candidates is reached."""
             requested = {q: 0 for q in query_to_artist}
             active = set(query_to_artist)
-            while active and len(candidates) < self.max_total_candidates:
+            while active and len(candidates) < self.target_total_candidates:
                 for q in list(active):
-                    if len(candidates) >= self.max_total_candidates:
+                    if len(candidates) >= self.target_total_candidates:
                         break
                     target = min(requested[q] + self.results_per_turn, per_query_cap)
-                    results = self._paginated_search(q, target)
+                    results = self._paginated_search(q, target, fresh_ids=fresh_track_ids)
                     requested[q] = target
                     artist_name = query_to_artist[q]
                     for track in results:
-                        if len(candidates) >= self.max_total_candidates:
+                        if len(candidates) >= self.target_total_candidates:
                             break
                         if artist_name and not any(
                             a["name"].lower() == artist_name.lower() for a in track["artists"]
@@ -1102,17 +1161,34 @@ class SongRadio:
                     if len(results) < target or target >= per_query_cap:
                         active.discard(q)
 
+        def genre_query_exhausted(genre):
+            entry = self._search_cache["queries"].get(f'genre:"{genre}"')
+            return bool(entry and entry.get("exhausted"))
+
+        def current_pool():
+            return [t for t in candidates.values() if t is not None]
+
+        def fresh_fraction(pool):
+            return sum(1 for t in pool if t["id"] in fresh_track_ids) / len(pool) if pool else 0.0
+
         # Never let the seed tracks themselves count as a "new recommendation"
         for seed_track in self.seed_tracks:
             key = (seed_track["artists"][0]["name"].lower(), self.normalize_title(seed_track["name"]))
             candidates[key] = None  # placeholder, filtered out below
 
-        # 1) Genre search for diversity across other artists
+        # 1) Genre search for diversity across other artists. Genres still
+        # known to have unexplored Spotify results are preferred over
+        # already-exhausted ones, so a random draw isn't wasted on a query
+        # that can only replay cached data.
         blocklist = self.LASTFM_JUNK_TAGS | self.excluded_genres
         specific_genres = [g for g in genre_counter if g not in blocklist]
         specific_genres.sort(key=lambda g: (-g.count(" "), -genre_counter[g]))
-        pool_size = min(len(specific_genres), self.genres_to_use * self.genre_pool_multiplier)
-        genre_pool = specific_genres[:pool_size]
+        non_exhausted = [g for g in specific_genres if not genre_query_exhausted(g)]
+        exhausted = [g for g in specific_genres if genre_query_exhausted(g)]
+        ordered_genres = non_exhausted + exhausted
+
+        pool_size = min(len(ordered_genres), self.genres_to_use * self.genre_pool_multiplier)
+        genre_pool = ordered_genres[:pool_size]
         if genre_pool:
             top_genres = random.sample(genre_pool, min(self.genres_to_use, len(genre_pool)))
         else:
@@ -1131,8 +1207,45 @@ class SongRadio:
             self.max_results_per_seed_artist,
         )
 
-        candidates.pop(None, None)
-        return [t for t in candidates.values() if t is not None]
+        # 3) Expansion rounds: if the initial search left the pool short of
+        # target_total_candidates or min_fresh_fraction, reach for genres
+        # that haven't been tried yet this run instead of quietly returning
+        # less than asked for. Bounded by max_candidate_expansion_rounds so
+        # a persistently thin genre neighborhood can't loop indefinitely.
+        tried_genres = set(top_genres)
+        remaining_genres = [g for g in ordered_genres if g not in tried_genres]
+        expansion_round = 0
+
+        while (
+            remaining_genres
+            and expansion_round < self.max_candidate_expansion_rounds
+            and (
+                len(current_pool()) < self.target_total_candidates
+                or fresh_fraction(current_pool()) < self.min_fresh_fraction
+            )
+        ):
+            expansion_round += 1
+            batch = remaining_genres[: self.genres_to_use]
+            remaining_genres = remaining_genres[self.genres_to_use :]
+            tried_genres.update(batch)
+            print(f"Expanding candidate search (round {expansion_round}): {batch}")
+            fetch_round_robin({f'genre:"{g}"': None for g in batch}, self.max_results_per_genre)
+
+        pool = current_pool()
+        final_fresh_fraction = fresh_fraction(pool)
+
+        if len(pool) < self.target_total_candidates:
+            print(
+                f"Note: Candidate pool reached {len(pool)}/{self.target_total_candidates} requested "
+                f"after {expansion_round} expansion round(s) - no further un-exhausted genres were available."
+            )
+        if final_fresh_fraction < self.min_fresh_fraction:
+            print(
+                f"Note: Only {final_fresh_fraction:.0%} of candidates came from fresh Spotify requests "
+                f"this run (target: {self.min_fresh_fraction:.0%})."
+            )
+
+        return pool
 
     def _genre_similarity(self, artist_tags):
         """Computes Jaccard similarity between an artist's tags and the seeds.
