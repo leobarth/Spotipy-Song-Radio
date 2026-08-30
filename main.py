@@ -1,9 +1,12 @@
 # notes:
-# introduce 
+# exploration factor for candidate building
+# ensure the max candidate limit is reached
+# all in all fix candidate building
 
 import argparse
 import json
 import logging
+import os
 
 
 def load_config():
@@ -44,31 +47,36 @@ def main():
     config = load_config()
     radio = SongRadio(**config)
 
-    print("Resolving seed tracks...")
-    seed_track_ids = radio.resolve_seed_track_ids()
-    if not seed_track_ids:
-        raise RuntimeError("No seed tracks found - aborting.")
+    try:
+        print("Resolving seed tracks...")
+        seed_track_ids = radio.resolve_seed_track_ids()
+        if not seed_track_ids:
+            raise RuntimeError("No seed tracks found - aborting.")
 
-    print("\nLoading artist data and genres...")
-    seed_artist_ids, genre_counter = radio.get_seed_artist_ids_and_genres(seed_track_ids)
+        print("\nLoading artist data and genres...")
+        seed_artist_ids, genre_counter = radio.get_seed_artist_ids_and_genres(seed_track_ids)
 
-    print("\n--- Detected Genres ---")
-    for genre, count in genre_counter.most_common(10):
-        print(f"  {genre}  (x{count})")
+        print("\n--- Detected Genres ---")
+        for genre, count in genre_counter.most_common(10):
+            print(f"  {genre}  (x{count})")
 
-    print("\nBuilding candidate pool...")
-    candidates = radio.build_candidate_pool(genre_counter)
-    print(f"{len(candidates)} candidates found.\n")
+        print("\nBuilding candidate pool...")
+        candidates = radio.build_candidate_pool(genre_counter)
+        print(f"{len(candidates)} candidates found.\n")
 
-    print("Selecting tracks...")
-    radio.filter_and_rank(candidates)
-    radio.print_results()
+        print("Selecting tracks...")
+        radio.filter_and_rank(candidates)
+        radio.print_results()
 
-    answer = input("\nSave as a playlist in your library? [Y/n] ").strip().lower()
-    if answer in ("", "y", "yes"):
-        radio.save_as_playlist()
-    else:
-        print("Playlist will not be saved.")
+        print("\n" + radio.lastfm_health_summary())
+
+        answer = input("\nSave as a playlist in your library? [Y/n] ").strip().lower()
+        if answer in ("", "y", "yes"):
+            radio.save_as_playlist()
+        else:
+            print("Playlist will not be saved.")
+    finally:
+        radio.close()
 
 
 def run_with_cprofile():
@@ -95,11 +103,44 @@ def run_with_cprofile():
         stats.sort_stats("cumulative").print_stats(20)
 
 
+def _print_func_stats(stats, limit, label):
+    """Prints a short, fixed-width table for a yappi func-stats iterable.
+
+    yappi's own stats.print_all() dumps every profiled function - typically
+    thousands of stdlib/library entries - which is unreadable in a terminal.
+    This prints at most `limit` rows instead.
+
+    Args:
+        stats: Iterable of yappi YFuncStat entries, already sorted.
+        limit: Maximum number of rows to print.
+        label: Section heading.
+
+    Returns:
+        None.
+    """
+    print(f"\n--- {label} (top {limit}) ---")
+    print(f"{'ncall':>8}  {'ttot(s)':>9}  {'tsub(s)':>9}  name")
+    shown = 0
+    for stat in stats:
+        if shown >= limit:
+            break
+        print(f"{stat.ncall:>8}  {stat.ttot:>9.3f}  {stat.tsub:>9.3f}  {stat.full_name}")
+        shown += 1
+
+
 def run_with_yappi():
     """Runs main() under yappi, which (unlike cProfile) tracks time across threads.
 
     Requires `pip install yappi`. Reports wall-clock time so that time spent
-    blocked on network I/O in worker threads is visible.
+    blocked on network I/O in worker threads is visible. Output is
+    deliberately trimmed to three short sections instead of yappi's default
+    full dump (which lists every stdlib/library function and floods the
+    terminal):
+      1. Project code only (this file + SongRadio.py), sorted by total time.
+      2. Top 15 functions overall (including libraries), for context.
+      3. A one-row-per-thread summary, showing how much wall time each
+         worker thread actually spent - the most direct evidence of whether
+         concurrency is being used effectively.
     """
     import yappi
 
@@ -109,9 +150,20 @@ def run_with_yappi():
         main()
     finally:
         yappi.stop()
-        stats = yappi.get_func_stats()
-        stats.sort("ttot", "desc")
-        stats.print_all(columns={0: ("name", 80), 1: ("ncall", 10), 2: ("tsub", 8), 3: ("ttot", 8)})
+
+        func_stats = yappi.get_func_stats()
+        func_stats.sort("ttot", "desc")
+
+        project_stats = [s for s in func_stats if os.path.basename(s.module) in {"main.py", "SongRadio.py"}]
+        _print_func_stats(project_stats, limit=25, label="Project code")
+        _print_func_stats(list(func_stats), limit=15, label="All code")
+
+        print("\n--- Per-thread summary ---")
+        thread_stats = yappi.get_thread_stats()
+        thread_stats.sort("ttot", "desc")
+        thread_stats.print_all()
+
+        yappi.clear_stats()
 
 
 if __name__ == "__main__":

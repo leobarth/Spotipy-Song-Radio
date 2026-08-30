@@ -38,8 +38,9 @@ import difflib
 import threading
 import time
 from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from functools import lru_cache
+from typing import cast
 
 import requests
 import spotipy
@@ -306,8 +307,8 @@ class SongRadio:
         genre_pool_multiplier: int = 2,
         min_track_listeners: int = 0,
         similarity_oversample_factor: int = 3,
-        lastfm_max_workers: int = 12,
-        lastfm_batch_size: int = 36,
+        lastfm_max_workers: int = 4,
+        lastfm_batch_size: int = 12,
         lastfm_max_retries: int = 4,
         lastfm_backoff_base: float = 1.0,
         lastfm_throttle_rate_alert: float = 0.15,
@@ -453,6 +454,11 @@ class SongRadio:
         self.lastfm_batch_size = lastfm_batch_size
         self.lastfm_max_retries = lastfm_max_retries
         self.lastfm_backoff_base = lastfm_backoff_base
+        # Created once and reused for every batch (see _run_concurrent) rather
+        # than per-batch, to avoid repeated thread creation/teardown overhead
+        # and to keep total OS thread count bounded by lastfm_max_workers for
+        # the whole run - both for real overhead and for readable profiler output.
+        self._lastfm_executor = ThreadPoolExecutor(max_workers=lastfm_max_workers, thread_name_prefix="lastfm")
         self._lastfm_monitor = LastFmRequestMonitor(
             api_key=lastfm_api_key,
             window_size=lastfm_monitor_window,
@@ -691,6 +697,50 @@ class SongRadio:
             self._artist_info_cache[artist_name] = info
         return info
 
+    def _run_concurrent(self, callables, max_workers):
+        """Runs zero-arg callables on the shared, persistent Last.fm thread pool.
+
+        Reuses self._lastfm_executor (created once in __init__) instead of
+        spinning up a fresh ThreadPoolExecutor per call, so total OS thread
+        count stays bounded by lastfm_max_workers for the whole run rather
+        than growing with the number of batches. Concurrency below the
+        pool's configured size (e.g. after an adaptive backoff) is achieved
+        by submitting in chunks, not by resizing the pool.
+
+        Args:
+            callables: List of zero-argument callables to run.
+            max_workers: Maximum number in flight at once for this call.
+
+        Returns:
+            List of concurrent.futures.Future objects, in the same order as
+            `callables`, each already completed.
+        """
+        futures: "list[Future | None]" = [None] * len(callables)
+        chunk_size = max(1, max_workers)
+        for start in range(0, len(callables), chunk_size):
+            chunk = callables[start : start + chunk_size]
+            future_to_idx = {self._lastfm_executor.submit(fn): start + i for i, fn in enumerate(chunk)}
+            for future in as_completed(future_to_idx):
+                futures[future_to_idx[future]] = future
+        # Every slot was filled above (one future per input callable across
+        # all chunks) - the None in the element type only existed to satisfy
+        # the initial placeholder list, not because a slot can stay empty.
+        return cast("list[Future]", futures)
+
+    def close(self):
+        """Shuts down the shared Last.fm thread pool.
+
+        Not strictly required for a one-shot script (process exit cleans
+        this up), but good hygiene if an instance is ever reused.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        self._lastfm_executor.shutdown(wait=True)
+
     def _fetch_artist_infos_batch(self, artist_names, max_workers):
         """Concurrently fetches Last.fm info for a batch of artists.
 
@@ -724,13 +774,14 @@ class SongRadio:
         if not to_fetch:
             return results
 
-        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-            future_to_name = {executor.submit(self._fetch_artist_info_one, name): name for name in to_fetch}
-            for future in as_completed(future_to_name):
-                name = future_to_name[future]
-                try:
-                    results[name] = future.result()
-                except Exception as e:
+        futures = self._run_concurrent(
+            [(lambda n=name: self._fetch_artist_info_one(n)) for name in to_fetch],
+            max_workers=max_workers,
+        )
+        for name, future in zip(to_fetch, futures):
+            try:
+                results[name] = future.result()
+            except Exception as e:
                     logger.warning("Artist info fetch failed for %s: %s", name, e)
                     results[name] = {"tags": set(), "listeners": None, "top_tracks": set()}
 
@@ -1180,18 +1231,17 @@ class SongRadio:
 
             track_listener_results = {}
             if survivors:
-                with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-                    future_to_idx = {
-                        executor.submit(self.lastfm_track_listeners, t["artists"][0]["name"], t["name"]): idx
-                        for idx, (t, _info) in enumerate(survivors)
-                    }
-                    for future in as_completed(future_to_idx):
-                        idx = future_to_idx[future]
-                        try:
-                            track_listener_results[idx] = future.result()
-                        except Exception as e:
-                            logger.warning("Track listener fetch failed: %s", e)
-                            track_listener_results[idx] = None
+                callables = [
+                    (lambda track=track: self.lastfm_track_listeners(track["artists"][0]["name"], track["name"]))
+                    for track, _info in survivors
+                ]
+                futures = self._run_concurrent(callables, max_workers=workers)
+                for idx, future in enumerate(futures):
+                    try:
+                        track_listener_results[idx] = future.result()
+                    except Exception as e:
+                        logger.warning("Track listener fetch failed: %s", e)
+                        track_listener_results[idx] = None
 
             for idx, (track, info) in enumerate(survivors):
                 if len(scored) >= oversample_target:
@@ -1319,7 +1369,7 @@ class SongRadio:
             n += 1
         return f"{base_name} #{n}"
 
-    def save_as_playlist(self, base_name="Song Radio"):
+    def save_as_playlist(self, base_name="Song Radio (Low-Mainstream)"):
         """Creates a private playlist with the recommendations (+ optionally seeds).
 
         Uses raw HTTP requests instead of spotipy methods for creation and
