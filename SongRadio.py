@@ -304,6 +304,7 @@ class SongRadio:
         target_total_candidates: int = 150,
         min_fresh_fraction: float = 0.2,
         max_candidate_expansion_rounds: int = 5,
+        min_discovered_genre_count: int = 2,
         # --- Filtering thresholds ---
         min_artist_listeners: int = 1_000,
         lastfm_listener_ceiling: int = 150_000,
@@ -371,6 +372,16 @@ class SongRadio:
                 trying to reach target_total_candidates / min_fresh_fraction,
                 so a persistently thin genre neighborhood can't loop
                 indefinitely.
+            min_discovered_genre_count: Once the genres originally derived
+                from the seed artists' own Last.fm tags are exhausted,
+                further expansion rounds "snowball" into genres found on
+                the candidate artists discovered so far. A newly-seen genre
+                only becomes eligible for this snowball expansion once it
+                has appeared on at least this many distinct candidate
+                artists - since those artists were themselves already
+                found via a genre/artist search relevant to the seeds, a
+                tag repeatedly co-occurring among them is a meaningfully
+                related sub-genre rather than a one-off/noise tag.
             min_artist_listeners: Minimum total listener count an artist must
                 have on Last.fm to be considered a candidate.
             lastfm_listener_ceiling: Maximum listener count a single track may
@@ -462,6 +473,7 @@ class SongRadio:
         self.target_total_candidates = target_total_candidates
         self.min_fresh_fraction = min_fresh_fraction
         self.max_candidate_expansion_rounds = max_candidate_expansion_rounds
+        self.min_discovered_genre_count = min_discovered_genre_count
 
         # --- Filtering thresholds ---
         self.min_artist_listeners = min_artist_listeners
@@ -1107,10 +1119,23 @@ class SongRadio:
         either goal. If the initial round still falls short of either
         target, additional not-yet-tried genres are queried in further
         rounds - each of which necessarily pulls live, fresh results, since
-        a genre only gets picked here if it hasn't been queried yet this run
-        - up to max_candidate_expansion_rounds, after which a genuine
-        shortfall is reported rather than silently returned as if nothing
-        were missing.
+        a genre only gets picked here if it hasn't been queried yet this run.
+
+        The genres available for this expansion start out limited to
+        whatever genre_counter already contains (the seed artists' own
+        Last.fm tags) - once that fixed list is exhausted, further rounds
+        "snowball" instead: Last.fm tags are fetched for the candidate
+        artists found so far (reusing the same cache/executor as
+        filter_and_rank, so this isn't wasted work), and a newly-seen tag
+        becomes eligible for expansion once it has appeared on at least
+        min_discovered_genre_count distinct candidate artists. Since those
+        artists were themselves already found via a genre/artist search
+        relevant to the seeds, a tag repeatedly co-occurring among them is
+        a meaningfully related sub-genre rather than a one-off/noise tag -
+        this is what keeps the snowball from wandering into unrelated
+        territory as it grows. Expansion is bounded overall by
+        max_candidate_expansion_rounds, after which a genuine shortfall is
+        reported rather than silently returned as if nothing were missing.
 
         Args:
             genre_counter: Counter mapping genre tag -> frequency (e.g. from
@@ -1122,6 +1147,8 @@ class SongRadio:
         """
         candidates = {}  # dedup_key -> track
         fresh_track_ids = set()  # track IDs obtained via a live Spotify request this run
+        discovered_genre_counter = Counter()  # tags seen on candidate artists, for snowball expansion
+        artists_with_discovered_tags = set()  # avoids double-counting an artist's tags across rounds
 
         def add_track(track):
             if not track or not track.get("id"):
@@ -1171,6 +1198,25 @@ class SongRadio:
         def fresh_fraction(pool):
             return sum(1 for t in pool if t["id"] in fresh_track_ids) / len(pool) if pool else 0.0
 
+        def update_discovered_genres():
+            """Folds Last.fm tags from any not-yet-processed candidate
+            artists into discovered_genre_counter, for snowball expansion
+            once the original seed-derived genre list runs out. Reuses
+            _fetch_artist_infos_batch (same cache/executor as
+            filter_and_rank), so these lookups aren't wasted - they warm
+            the cache for later instead of duplicating work."""
+            pool_artists = {t["artists"][0]["name"] for t in current_pool()}
+            new_artists = pool_artists - artists_with_discovered_tags
+            if not new_artists:
+                return
+            infos = self._fetch_artist_infos_batch(new_artists, max_workers=self.lastfm_max_workers)
+            blocklist_for_discovery = self.LASTFM_JUNK_TAGS | self.excluded_genres
+            for artist_name, info in infos.items():
+                artists_with_discovered_tags.add(artist_name)
+                for tag in info["tags"]:
+                    if tag not in blocklist_for_discovery:
+                        discovered_genre_counter[tag] += 1
+
         # Never let the seed tracks themselves count as a "new recommendation"
         for seed_track in self.seed_tracks:
             key = (seed_track["artists"][0]["name"].lower(), self.normalize_title(seed_track["name"]))
@@ -1210,20 +1256,32 @@ class SongRadio:
         # 3) Expansion rounds: if the initial search left the pool short of
         # target_total_candidates or min_fresh_fraction, reach for genres
         # that haven't been tried yet this run instead of quietly returning
-        # less than asked for. Bounded by max_candidate_expansion_rounds so
-        # a persistently thin genre neighborhood can't loop indefinitely.
+        # less than asked for. Starts with the remaining seed-derived
+        # genres; once those run out, snowballs into genres discovered from
+        # candidate artists found so far (see update_discovered_genres).
+        # Bounded by max_candidate_expansion_rounds so a persistently thin
+        # genre neighborhood can't loop indefinitely.
         tried_genres = set(top_genres)
         remaining_genres = [g for g in ordered_genres if g not in tried_genres]
         expansion_round = 0
 
         while (
-            remaining_genres
-            and expansion_round < self.max_candidate_expansion_rounds
+            expansion_round < self.max_candidate_expansion_rounds
             and (
                 len(current_pool()) < self.target_total_candidates
                 or fresh_fraction(current_pool()) < self.min_fresh_fraction
             )
         ):
+            if not remaining_genres:
+                update_discovered_genres()
+                remaining_genres = [
+                    g for g, count in discovered_genre_counter.most_common()
+                    if g not in tried_genres and count >= self.min_discovered_genre_count
+                    and not genre_query_exhausted(g)
+                ]
+                if not remaining_genres:
+                    break  # genuinely nothing related left to try
+
             expansion_round += 1
             batch = remaining_genres[: self.genres_to_use]
             remaining_genres = remaining_genres[self.genres_to_use :]
@@ -1462,17 +1520,23 @@ class SongRadio:
         return names
 
     def _unique_playlist_name(self, base_name):
-        """Generates a unique playlist name via numbering.
+        """Generates a unique, seed-prefixed playlist name via numbering.
 
-        Checks base_name against the user's existing playlist names and
-        appends " #2", " #3", etc. on a collision, until the name is free.
+        The name is base_name prefixed with the first configured seed
+        track's title (i.e. the first value in self.seed_queries, in
+        insertion order) so playlists from different seeds are easy to
+        tell apart at a glance. Checks the result against the user's
+        existing playlist names and appends " #2", " #3", etc. on a
+        collision, until the name is free.
 
         Args:
-            base_name: Desired base name of the playlist.
+            base_name: Desired base name of the playlist, appended after
+                the seed track title.
 
         Returns:
-            Unique playlist name (str): either base_name itself, or base_name
-            with a number appended.
+            Unique playlist name (str): "{first seed title}: {base_name}",
+            or that string with a number appended if it collides with an
+            existing playlist name.
         """
         existing = self._existing_playlist_names()
         name = f"{next(iter(self.seed_queries.values()))}: {base_name}"

@@ -1,41 +1,45 @@
 {
-    "client_id": "ADD_YOURS",
-    "client_secret": "ADD_YOURS",
-    "redirect_uri": "ADD_YOURS",
-    "lastfm_api_key": "ADD_YOURS",
-    "seed_queries": {
-        "Some Artist": "Some Song/Track"
-    },
-    "include_seed_tracks": true,
-    "result_limit": 15,
-    "similarity_oversample_factor": 3,
-    "genres_to_use": 5,
-    "genre_pool_multiplier": 2,
-    "results_per_turn": 10,
-    "max_results_per_genre": 300,
-    "max_results_per_seed_artist": 200,
-    "target_total_candidates": 150,
-    "min_fresh_fraction": 0.2,
-    "max_candidate_expansion_rounds": 5,
-    "min_artist_listeners": 1000,
-    "lastfm_listener_ceiling": 150000,
-    "min_track_listeners": 0,
-    "artist_top_hit_exclude_n": 5,
-    "allowed_languages": [
-        "en",
-        "de"
-    ],
-    "excluded_artists": [],
-    "excluded_genres": [],
-    "cache_path": "spotify_search_cache.json",
-    "cache_ttl_days": 30,
-    "lastfm_max_workers": 4,
-    "lastfm_batch_size": 12,
-    "lastfm_max_retries": 4,
-    "lastfm_backoff_base": 1,
-    "lastfm_throttle_rate_alert": 0.15,
-    "lastfm_error_rate_alert": 0.3,
-    "lastfm_monitor_window": 40,
-    "lastfm_latency_alert_multiplier": 2,
-    "lastfm_baseline_sample_size": 20
+  "client_id": "YOUR_SPOTIFY_CLIENT_ID",
+  "client_secret": "YOUR_SPOTIFY_CLIENT_SECRET",
+  "redirect_uri": "YOUR_REDIRECT_URI",
+  "lastfm_api_key": "YOUR_LASTFM_API_KEY",
+
+  "seed_queries": {
+    "Some Artist": "Some Song Title"
+  },
+  "include_seed_tracks": true,
+
+  "result_limit": 15,
+  "similarity_oversample_factor": 3,
+
+  "genres_to_use": 5,
+  "genre_pool_multiplier": 2,
+  "results_per_turn": 10,
+  "max_results_per_genre": 300,
+  "max_results_per_seed_artist": 200,
+  "target_total_candidates": 150,
+  "min_fresh_fraction": 0.2,
+  "max_candidate_expansion_rounds": 5,
+  "min_discovered_genre_count": 2,
+
+  "min_artist_listeners": 1000,
+  "lastfm_listener_ceiling": 150000,
+  "min_track_listeners": 0,
+  "artist_top_hit_exclude_n": 5,
+  "allowed_languages": ["en", "de"],
+  "excluded_artists": [],
+  "excluded_genres": [],
+
+  "cache_path": "spotify_search_cache.json",
+  "cache_ttl_days": 30,
+
+  "lastfm_max_workers": 4,
+  "lastfm_batch_size": 12,
+  "lastfm_max_retries": 4,
+  "lastfm_backoff_base": 1.0,
+  "lastfm_throttle_rate_alert": 0.15,
+  "lastfm_error_rate_alert": 0.3,
+  "lastfm_monitor_window": 40,
+  "lastfm_latency_alert_multiplier": 2.0,
+  "lastfm_baseline_sample_size": 20
 }
