@@ -8,10 +8,8 @@
         "Some Artist": "Some Song Title"
     },
     "include_seed_tracks": true,
-
     "result_limit": 15,
     "similarity_oversample_factor": 3,
-
     "genres_to_use": 5,
     "genre_pool_multiplier": 2,
     "results_per_turn": 10,
@@ -21,7 +19,6 @@
     "min_fresh_fraction": 0.2,
     "max_candidate_expansion_rounds": 5,
     "min_discovered_genre_count": 2,
-
     "min_artist_listeners": 1000,
     "lastfm_listener_ceiling": 150000,
     "min_track_listeners": 0,
@@ -32,11 +29,7 @@
     ],
     "excluded_artists": [],
     "excluded_genres": [],
-
-    "cache_path": "spotify_search_cache.json",
     "cache_ttl_days": 30,
-
-    "cache_save_interval": 2.0,
     "lastfm_max_workers": 4,
     "lastfm_batch_size": 12,
     "lastfm_max_retries": 4,
@@ -44,6 +37,6 @@
     "lastfm_throttle_rate_alert": 0.15,
     "lastfm_error_rate_alert": 0.3,
     "lastfm_monitor_window": 40,
-    "lastfm_latency_alert_multiplier": 2,
+    "lastfm_latency_alert_multiplier": 2.0,
     "lastfm_baseline_sample_size": 20
 }

@@ -1,6 +1,10 @@
 .venv/
+venv/
 config.json
 .cache
 __pycache__/
 spotify_search_cache.json
 spotify_search_cache.tracks.json
+spotify_search_cache.db
+spotify_search_cache.db-shm
+spotify_search_cache.db-wal

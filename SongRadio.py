@@ -34,7 +34,7 @@ import logging
 import random
 import re
 import json
-import os
+import sqlite3
 import difflib
 import threading
 import time
@@ -315,9 +315,8 @@ class SongRadio:
         excluded_artists: list = [],
         excluded_genres: list = [],
         # --- Local Spotify search cache ---
-        cache_path: str = "spotify_search_cache.json",
+        cache_path: str = "spotify_search_cache.db",
         cache_ttl_days: float = 30,
-        cache_save_interval: float = 2.0,
         # --- Last.fm concurrency / resilience ---
         lastfm_max_workers: int = 4,
         lastfm_batch_size: int = 12,
@@ -398,27 +397,18 @@ class SongRadio:
             excluded_artists: Artist names that should never appear as candidates.
             excluded_genres: Genre tags that should never be used as a search
                 term and whose artists get hard-excluded.
-            cache_path: Path to the local JSON file used to persist Spotify
-                search results across runs, so identical queries don't
-                re-fetch already-seen offsets and instead explore new ones.
-                The (potentially much larger) track-object data is stored
-                separately in a sibling file derived from this path (see
-                _derive_tracks_cache_path) - a legacy single-file cache at
-                this path is transparently migrated into the split layout
-                the first time it's loaded.
+            cache_path: Path to the local SQLite database used to persist
+                Spotify search results across runs, so identical queries
+                don't re-fetch already-seen offsets and instead explore new
+                ones. Individual queries/tracks are inserted or updated as
+                their own rows, so recording progress never requires
+                rewriting the whole cache - unlike the previous JSON-based
+                format, this scales with what changed, not with how much
+                has accumulated across every prior run.
             cache_ttl_days: After how many days a cached query's exploration
                 state (offsets_fetched/exhausted) is reset so it gets
                 re-scanned from offset 0, to catch drift in Spotify's ranking.
                 Set to 0 to disable expiration entirely.
-            cache_save_interval: Minimum seconds between writes of the
-                track-object cache file during active fetching (see
-                _maybe_flush_tracks_cache). Rewriting that file scales with
-                how many tracks have accumulated across all prior runs, so
-                doing it after every single fetched page becomes the
-                dominant cost of a run once the cache has grown - this
-                debounces it, while a full flush still always happens on
-                terminal events (query exhausted, an error, a 429 abort,
-                or the end of a fetch) so progress is never lost.
             lastfm_max_workers: Maximum number of concurrent Last.fm requests
                 in a batch. This is a ceiling, not a fixed value - the
                 effective concurrency adapts downward if 429s are observed
@@ -503,11 +493,7 @@ class SongRadio:
         # --- Local Spotify search cache ---
         self.cache_path = cache_path
         self.cache_ttl_days = cache_ttl_days
-        self.cache_save_interval = cache_save_interval
-        self._tracks_cache_path = self._derive_tracks_cache_path(cache_path)
-        self._tracks_cache_dirty = False
-        self._last_tracks_flush = time.monotonic()
-        self._search_cache = self._load_search_cache()
+        self._search_db = self._init_search_db(cache_path)
         self.search_limit = 10  # Spotify maximum since Feb 2026
         self.request_sleep = 0.2  # a bit generous, to avoid bursts
         self._max_offset = 990  # safety cap for offset pagination
@@ -798,7 +784,7 @@ class SongRadio:
         return cast("list[Future]", futures)
 
     def close(self):
-        """Shuts down the shared Last.fm thread pool.
+        """Shuts down the shared Last.fm thread pool and the search cache DB.
 
         Not strictly required for a one-shot script (process exit cleans
         this up), but good hygiene if an instance is ever reused.
@@ -810,6 +796,7 @@ class SongRadio:
             None.
         """
         self._lastfm_executor.shutdown(wait=True)
+        self._search_db.close()
 
     def _fetch_artist_infos_batch(self, artist_names, max_workers):
         """Concurrently fetches Last.fm info for a batch of artists.
@@ -981,155 +968,137 @@ class SongRadio:
         return artist_ids, genre_counter
 
     @staticmethod
-    def _derive_tracks_cache_path(cache_path):
-        """Derives the sibling file path used for the track-object cache.
+    def _init_search_db(cache_path):
+        """Opens (creating if needed) the SQLite search-cache database.
 
-        e.g. "spotify_search_cache.json" -> "spotify_search_cache.tracks.json".
-        Keeping this file separate from the (small, frequently-rewritten)
-        query-metadata file is what makes debounced saving worthwhile - see
-        _maybe_flush_tracks_cache.
+        Schema: "tracks" (id -> JSON-encoded track object), "queries" (one
+        row per Spotify query with its exploration state), and
+        "query_tracks" (which tracks were found by which query, so a track
+        discovered by multiple queries is still only stored once). Every
+        write elsewhere in this class targets exactly the row(s) that
+        changed - a single new track or a single query's progress update -
+        rather than re-serializing the whole cache, which is what made the
+        previous JSON-based format's cost scale with total accumulated
+        history instead of with the current run's actual work.
+
+        WAL journal mode is used so commits are fast and don't block reads
+        from a concurrent process (e.g. inspecting the cache while a run is
+        in progress). This connection is only ever used from the main
+        thread - Spotify search/caching isn't parallelized, only the
+        Last.fm lookups are (see _run_concurrent) - so no locking around it
+        is needed.
 
         Args:
-            cache_path: Path to the query-metadata cache file (self.cache_path).
+            cache_path: Path to the SQLite database file.
 
         Returns:
-            str path.
+            sqlite3.Connection.
         """
-        root, ext = os.path.splitext(cache_path)
-        return f"{root}.tracks{ext or '.json'}"
+        db = sqlite3.connect(cache_path)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE IF NOT EXISTS tracks (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS queries ("
+            "query TEXT PRIMARY KEY, offsets_fetched TEXT NOT NULL DEFAULT '[]', "
+            "exhausted INTEGER NOT NULL DEFAULT 0, last_fetched_at REAL)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS query_tracks ("
+            "query TEXT NOT NULL, track_id TEXT NOT NULL, PRIMARY KEY (query, track_id))"
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_query_tracks_query ON query_tracks(query)")
+        db.commit()
+        return db
 
-    def _load_search_cache(self):
-        """Loads the persistent Spotify search cache from disk.
-
-        Stored as two files: self.cache_path holds only the small,
-        frequently-changing query-exploration metadata (offsets_fetched,
-        exhausted, track_ids, last_fetched_at); self._tracks_cache_path
-        holds the track objects themselves, which accumulate across every
-        run and are the expensive part to rewrite. A legacy single-file
-        cache (the original format: one JSON file containing both "tracks"
-        and "queries") found at self.cache_path is transparently migrated
-        into this split layout on load, so previously-accumulated cache
-        data - including exhausted-query state, expensive to rebuild - is
-        preserved rather than silently discarded by the format change.
+    def _get_query_state(self, query):
+        """Reads a query's exploration state from the cache.
 
         Args:
-            None.
+            query: Spotify search query string.
 
         Returns:
-            dict with "tracks" (id -> track object, deduplicated globally)
-            and "queries" (query string -> {"offsets_fetched": list[int],
-            "exhausted": bool, "track_ids": list[str]}) - the same
-            in-memory shape as before the split, so nothing else in this
-            class needs to know the cache is now two files on disk.
+            dict with "offsets_fetched" (list[int]), "exhausted" (bool),
+            "last_fetched_at" (float or None). A fresh/default state is
+            returned if the query has never been cached.
         """
-        try:
-            with open(self.cache_path, "r") as f:
-                cache_path_contents = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            cache_path_contents = {}
+        row = self._search_db.execute(
+            "SELECT offsets_fetched, exhausted, last_fetched_at FROM queries WHERE query = ?", (query,)
+        ).fetchone()
+        if row is None:
+            return {"offsets_fetched": [], "exhausted": False, "last_fetched_at": None}
+        offsets_fetched, exhausted, last_fetched_at = row
+        return {
+            "offsets_fetched": json.loads(offsets_fetched),
+            "exhausted": bool(exhausted),
+            "last_fetched_at": last_fetched_at,
+        }
 
-        try:
-            with open(self._tracks_cache_path, "r") as f:
-                tracks = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            tracks = {}
+    def _save_query_state(self, query, state):
+        """Upserts a single query's exploration state.
 
-        is_legacy_combined_file = {"tracks", "queries"} <= set(cache_path_contents)
-        if is_legacy_combined_file:
-            queries = cache_path_contents.get("queries", {})
-            tracks = tracks or cache_path_contents.get("tracks", {})
-            print(f"Migrating legacy cache '{self.cache_path}' to the split query/track format...")
-            with open(self.cache_path, "w") as f:
-                json.dump(queries, f)
-            with open(self._tracks_cache_path, "w") as f:
-                json.dump(tracks, f)
-        else:
-            queries = cache_path_contents
-
-        return {"tracks": tracks, "queries": queries}
-
-    def _save_queries_cache(self):
-        """Persists just the query-exploration metadata to disk.
-
-        This file stays small regardless of how many tracks have
-        accumulated, so it's cheap to write after every fetched page -
-        unlike the track-object cache (see _maybe_flush_tracks_cache).
+        A single-row write regardless of how many other queries or tracks
+        have ever been cached - this is what replaces the old
+        "re-serialize the entire cache" save.
 
         Args:
-            None.
-
-        Returns:
-            None.
-        """
-        with open(self.cache_path, "w") as f:
-            json.dump(self._search_cache["queries"], f)
-
-    def _save_tracks_cache(self):
-        """Persists the accumulated track-object cache to disk.
-
-        This file grows across every run and is the expensive part to
-        rewrite - callers should generally go through
-        _maybe_flush_tracks_cache rather than calling this directly on a
-        hot path.
-
-        Args:
-            None.
+            query: Spotify search query string.
+            state: dict as returned by _get_query_state.
 
         Returns:
             None.
         """
-        with open(self._tracks_cache_path, "w") as f:
-            json.dump(self._search_cache["tracks"], f)
+        self._search_db.execute(
+            "INSERT INTO queries (query, offsets_fetched, exhausted, last_fetched_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(query) DO UPDATE SET "
+            "offsets_fetched=excluded.offsets_fetched, exhausted=excluded.exhausted, "
+            "last_fetched_at=excluded.last_fetched_at",
+            (query, json.dumps(state["offsets_fetched"]), int(state["exhausted"]), state["last_fetched_at"]),
+        )
+        self._search_db.commit()
 
-    def _maybe_flush_tracks_cache(self, force=False):
-        """Debounced save of the track-object cache.
-
-        Rewriting the full track cache scales with how many tracks have
-        accumulated across every prior run, not with how much work the
-        current call is doing - profiling showed this becoming the
-        dominant cost of a run once the cache had grown large, since the
-        original code saved it after every single fetched Spotify page.
-        This only actually writes when forced (terminal events - query
-        exhausted, an error, a 429 abort, or the end of a fetch - all pass
-        force=True) or when at least self.cache_save_interval seconds have
-        passed since the last write, so a long fetch still gets periodic
-        durability without paying the full cost on every page.
+    def _get_cached_tracks_for_query(self, query):
+        """Fetches the track objects already known to belong to a query.
 
         Args:
-            force: If True, writes immediately regardless of the interval
-                (still a no-op if nothing has changed since the last save).
+            query: Spotify search query string.
+
+        Returns:
+            List of track objects (dicts), in no particular order.
+        """
+        rows = self._search_db.execute(
+            "SELECT t.data FROM query_tracks qt JOIN tracks t ON t.id = qt.track_id WHERE qt.query = ?", (query,)
+        ).fetchall()
+        return [json.loads(data) for (data,) in rows]
+
+    def _store_track_for_query(self, query, track):
+        """Upserts one track and links it to a query, in a single transaction.
+
+        Args:
+            query: Spotify search query string this track was found under.
+            track: Spotify track object (dict); must have an "id".
 
         Returns:
             None.
         """
-        if not self._tracks_cache_dirty:
-            return
-        now = time.monotonic()
-        if not force and (now - self._last_tracks_flush) < self.cache_save_interval:
-            return
-        self._save_tracks_cache()
-        self._tracks_cache_dirty = False
-        self._last_tracks_flush = now
+        self._search_db.execute(
+            "INSERT INTO tracks (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+            (track["id"], json.dumps(track)),
+        )
+        self._search_db.execute(
+            "INSERT OR IGNORE INTO query_tracks (query, track_id) VALUES (?, ?)", (query, track["id"]),
+        )
 
-    def _save_search_cache(self):
-        """Forces an immediate, full save of both cache files.
-
-        Prefer this at terminal events where a guaranteed flush matters
-        more than avoiding I/O (query exhausted, an error/abort, or the
-        end of a fetch). During normal per-page progress, use
-        _save_queries_cache (cheap, every page) plus
-        _maybe_flush_tracks_cache (debounced) instead - see
-        _paginated_search.
+    def _is_query_exhausted(self, query):
+        """Checks whether a query is already known to have no more results.
 
         Args:
-            None.
+            query: Spotify search query string.
 
         Returns:
-            None.
+            bool.
         """
-        self._save_queries_cache()
-        self._tracks_cache_dirty = True
-        self._maybe_flush_tracks_cache(force=True)
+        row = self._search_db.execute("SELECT exhausted FROM queries WHERE query = ?", (query,)).fetchone()
+        return bool(row and row[0])
 
     def _paginated_search(self, query, max_results, fresh_ids=None):
         """Pages through Spotify search results via offset.
@@ -1142,21 +1111,19 @@ class SongRadio:
         (raise), so the lockout isn't extended by further requests.
 
         Reuses previously cached results for this exact query (see
-        self._search_cache) instead of re-fetching them, and only issues live
+        self._search_db) instead of re-fetching them, and only issues live
         Spotify requests for offsets not yet visited by any prior run. If the
         cached entry is older than self.cache_ttl_days, its exploration state
         (offsets_fetched/exhausted) is reset so it gets re-scanned from
         offset 0 - this catches drift in Spotify's ranking over time, at the
         cost of re-fetching the top results once. Previously found tracks are
-        never discarded. Query-exploration metadata (offsets_fetched,
-        exhausted) is saved after every fetched offset, so that progress
-        isn't lost if the run aborts - this file is small regardless of
-        cache size, so it's cheap to write that often. The much larger
-        track-object cache is saved on a debounced schedule instead (see
-        _maybe_flush_tracks_cache), since rewriting it scales with every
-        track ever cached, not with this one page; terminal events (query
-        exhausted, an error, a 429 abort, or the end of this call) still
-        force an immediate full flush regardless of the debounce interval.
+        never discarded. Both the query's exploration state and any newly
+        found tracks are committed to the SQLite cache after every fetched
+        page (see _save_query_state/_store_track_for_query), and also on
+        terminal events (an error, a 429 abort) before this function exits
+        early - each such write only touches the row(s) that changed, so
+        doing this every page costs the same regardless of how large the
+        cache has grown overall.
 
         Args:
             query: Spotify search query (e.g. 'genre:"funk rock"').
@@ -1175,23 +1142,20 @@ class SongRadio:
             spotipy.exceptions.SpotifyException: On a 429 with a long/unknown
                 wait time, or when spotipy re-raises the exception (via `raise`).
         """
-        entry = self._search_cache["queries"].setdefault(
-            query, {"offsets_fetched": [], "exhausted": False, "track_ids": [], "last_fetched_at": None}
-        )
+        state = self._get_query_state(query)
 
-        if self.cache_ttl_days and entry["last_fetched_at"]:
-            age_days = (time.time() - entry["last_fetched_at"]) / 86400
+        if self.cache_ttl_days and state["last_fetched_at"]:
+            age_days = (time.time() - state["last_fetched_at"]) / 86400
             if age_days > self.cache_ttl_days:
-                entry["offsets_fetched"] = []
-                entry["exhausted"] = False
+                state["offsets_fetched"] = []
+                state["exhausted"] = False
 
-        tracks_by_id = self._search_cache["tracks"]
-        collected = [tracks_by_id[tid] for tid in entry["track_ids"] if tid in tracks_by_id]
+        collected = self._get_cached_tracks_for_query(query)
 
-        if entry["exhausted"] or len(collected) >= max_results:
+        if state["exhausted"] or len(collected) >= max_results:
             return collected
 
-        offset = (max(entry["offsets_fetched"]) + self.search_limit) if entry["offsets_fetched"] else 0
+        offset = (max(state["offsets_fetched"]) + self.search_limit) if state["offsets_fetched"] else 0
         while offset < max_results and offset <= self._max_offset:
             try:
                 results = self.sp.search(q=query, type="track", limit=self.search_limit, offset=offset)
@@ -1214,45 +1178,42 @@ class SongRadio:
                         continue
                     wait_msg = f"{retry_after}s" if retry_after is not None else f"unknown ({raw_retry})"
                     print(f"Rate limit reached (wait time: {wait_msg}) - aborting completely.")
-                    self._save_search_cache()  # force-flush: about to hard-abort, don't lose this call's progress
+                    self._save_query_state(query, state)  # persist progress made so far before hard-aborting
                     raise  # hard-stops the script so it doesn't proceed as if it "succeeded"
                 else:
                     # A DIFFERENT Spotify error occurred (e.g. 500, 400, 401)
                     print(f"Unexpected API error for query '{query}': {e}")
-                    self._save_search_cache()  # force-flush before abandoning this query
+                    self._save_query_state(query, state)  # persist progress before abandoning this query
                     break  # skips THIS search, but continues with the next artist
             except Exception as e:
                 # Catches general network timeouts (requests.exceptions.ReadTimeout)
                 print(f"Network or system error: {e}")
-                self._save_search_cache()  # force-flush before abandoning this query
+                self._save_query_state(query, state)  # persist progress before abandoning this query
                 break
             time.sleep(self.request_sleep)
             assert results is not None
             items = results.get("tracks", {}).get("items", [])
-            entry["offsets_fetched"].append(offset)
-            entry["last_fetched_at"] = time.time()
+            state["offsets_fetched"].append(offset)
+            state["last_fetched_at"] = time.time()
             if not items:
-                entry["exhausted"] = True
-                self._save_search_cache()  # force-flush: exhaustion is worth persisting immediately
+                state["exhausted"] = True
+                self._save_query_state(query, state)
                 break  # reached the end of the filtered database
             for track in items:
                 if track and track.get("id"):
-                    tracks_by_id[track["id"]] = track
-                    if track["id"] not in entry["track_ids"]:
-                        entry["track_ids"].append(track["id"])
+                    self._store_track_for_query(query, track)
                     collected.append(track)
                     if fresh_ids is not None:
                         fresh_ids.add(track["id"])  # obtained via a live request, not the cache replay above
-                    self._tracks_cache_dirty = True
-            # Query metadata (offsets_fetched/exhausted) stays small regardless
-            # of how many tracks have ever been cached, so saving it every page
-            # is cheap. The track cache itself is debounced - see
-            # _maybe_flush_tracks_cache - since rewriting it scales with the
-            # total accumulated cache, not with this one page.
-            self._save_queries_cache()
-            self._maybe_flush_tracks_cache()
+            # Each write here is scoped to exactly this page's rows (see
+            # _store_track_for_query/_save_query_state) rather than
+            # re-serializing the whole cache, so there's no cost trade-off
+            # in doing this every page - unlike the old JSON format, this
+            # doesn't need debouncing to stay cheap. _save_query_state's
+            # commit below covers both the track rows just inserted and
+            # this query's updated state, atomically, in one transaction.
+            self._save_query_state(query, state)
             offset += self.search_limit
-        self._maybe_flush_tracks_cache(force=True)  # guarantee durability at the end of this call
         return collected
 
     def build_candidate_pool(self, genre_counter):
@@ -1272,7 +1233,7 @@ class SongRadio:
 
         target_total_candidates and min_fresh_fraction are treated as goals
         to actively work toward rather than passive caps: when sampling
-        genres, not-yet-exhausted ones (see self._search_cache) are
+        genres, not-yet-exhausted ones (see self._search_db) are
         preferred over ones already known to have no more Spotify results
         left, since a query that can only replay cached data can't help
         either goal. If the initial round still falls short of either
@@ -1348,8 +1309,7 @@ class SongRadio:
                         active.discard(q)
 
         def genre_query_exhausted(genre):
-            entry = self._search_cache["queries"].get(f'genre:"{genre}"')
-            return bool(entry and entry.get("exhausted"))
+            return self._is_query_exhausted(f'genre:"{genre}"')
 
         def current_pool():
             return [t for t in candidates.values() if t is not None]
