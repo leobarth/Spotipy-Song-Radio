@@ -834,6 +834,7 @@ class SongRadio:
 
         persisted = self._load_persisted_artist_field(artist_name, "tags")
         if persisted is not _CACHE_MISS:
+            assert not isinstance(persisted, object)
             tags = persisted[:limit]
             with self._cache_lock:
                 self._tags_cache[cache_key] = tags
@@ -951,6 +952,7 @@ class SongRadio:
 
         persisted = self._load_persisted_artist_field(artist_name, "top_tracks")
         if persisted is not _CACHE_MISS:
+            assert not isinstance(persisted, object)
             names = set(persisted[: self.artist_top_hit_exclude_n])
             with self._cache_lock:
                 self._top_tracks_cache[artist_name] = names
