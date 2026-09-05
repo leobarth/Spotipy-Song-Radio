@@ -39,7 +39,7 @@ import difflib
 import threading
 import time
 from collections import Counter, deque
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from functools import lru_cache
 from typing import cast
 
@@ -49,6 +49,12 @@ from langdetect import LangDetectException, detect
 from spotipy.oauth2 import SpotifyOAuth
 
 logger = logging.getLogger("song_radio.lastfm")
+
+# Distinguishes "not cached / never fetched / expired" from a legitimately
+# cached value of None (e.g. an artist Last.fm genuinely has no listener
+# count for) in the persisted Last.fm cache - see
+# SongRadio._load_persisted_artist_field / _load_persisted_track_listeners.
+_CACHE_MISS = object()
 
 
 class LastFmRequestMonitor:
@@ -262,7 +268,7 @@ class SongRadio:
         "love", "beautiful", "usa", "american", "uk", "british", "australian",
         "male vocalists", "female vocalists", "instrumental", "cover", "covers",
         "guilty pleasure", "guilty pleasures", "classic", "classics", "legend",
-        "legendary", "under 2000 listeners", "spotify",
+        "legendary", "under 2000 listeners", "spotify", "all",
     }
     # Typical suffixes that mark a different "version" of the same song
     VERSION_SUFFIX_PATTERNS = [
@@ -282,6 +288,26 @@ class SongRadio:
 
     MIN_TRACK_DURATION_MS = 60_000  # tracks shorter than this are filtered out by default
     RATE_LIMIT_AUTO_RETRY_THRESHOLD = 30  # seconds - above this: abort immediately instead of waiting
+    MAX_UNKNOWN_429_RETRIES = 2  # short retries for a 429 with no usable Retry-After before hard-aborting
+
+    # Persisted Last.fm cache: always fetch/store this many tags/top-tracks
+    # regardless of what a given call site's `limit` or instance's
+    # artist_top_hit_exclude_n happens to be, and slice locally on read -
+    # so the on-disk cache stays valid and reusable across calls/runs that
+    # ask for different limits, instead of needing a re-fetch whenever a
+    # larger limit is requested than what was originally cached.
+    PERSISTED_TAGS_LIMIT = 50
+    PERSISTED_TOP_TRACKS_LIMIT = 20
+    # Maps a logical artist-info field to its (value_column, fetched_at_column)
+    # pair in the lastfm_artists table - see _load_persisted_artist_field /
+    # _save_persisted_artist_field. Internal, fixed set of keys only (never
+    # built from external input), so it's safe to use for f-string column
+    # names in those helpers.
+    _ARTIST_FIELD_COLUMNS = {
+        "tags": ("tags_json", "tags_fetched_at"),
+        "listeners": ("listeners", "listeners_fetched_at"),
+        "top_tracks": ("top_tracks_json", "top_tracks_fetched_at"),
+    }
 
     def __init__(
         self,
@@ -317,6 +343,8 @@ class SongRadio:
         # --- Local Spotify search cache ---
         cache_path: str = "spotify_search_cache.db",
         cache_ttl_days: float = 30,
+        # --- Persisted Last.fm cache ---
+        lastfm_cache_ttl_days: float = 14,
         # --- Last.fm concurrency / resilience ---
         lastfm_max_workers: int = 4,
         lastfm_batch_size: int = 12,
@@ -409,6 +437,15 @@ class SongRadio:
                 state (offsets_fetched/exhausted) is reset so it gets
                 re-scanned from offset 0, to catch drift in Spotify's ranking.
                 Set to 0 to disable expiration entirely.
+            lastfm_cache_ttl_days: After how many days a persisted Last.fm
+                artist/track cache entry (tags, listeners, top tracks - see
+                the lastfm_artists/lastfm_tracks tables in the same SQLite
+                file as cache_path) is treated as stale and re-fetched
+                instead of reused. Separate from cache_ttl_days since
+                Last.fm data (listener counts especially) drifts on its own
+                timescale, independent of how often Spotify's search
+                ranking is re-scanned. Set to 0 to disable expiration
+                entirely.
             lastfm_max_workers: Maximum number of concurrent Last.fm requests
                 in a batch. This is a ceiling, not a fixed value - the
                 effective concurrency adapts downward if 429s are observed
@@ -498,10 +535,29 @@ class SongRadio:
         self.request_sleep = 0.2  # a bit generous, to avoid bursts
         self._max_offset = 990  # safety cap for offset pagination
 
+        # --- Persisted Last.fm cache (same SQLite file as cache_path,
+        # tables created above by _init_search_db) ---
+        self.lastfm_cache_ttl_days = lastfm_cache_ttl_days
+        # self._search_db is main-thread-only by design (Spotify search
+        # caching isn't parallelized - see _init_search_db's docstring), but
+        # Last.fm lookups run concurrently from the executor's worker
+        # threads (see _run_concurrent), so persisting them needs a
+        # connection that's actually safe to use from those threads. A
+        # second connection to the same file, rather than reusing
+        # self._search_db across threads, keeps that existing
+        # single-thread invariant intact. All access to this connection is
+        # serialized through self._cache_lock below - SQLite only allows
+        # one writer at a time on a given file regardless, so this doesn't
+        # add meaningful contention beyond what the in-memory caches
+        # guarded by the same lock already have.
+        self._lastfm_db = sqlite3.connect(cache_path, check_same_thread=False)
+        self._lastfm_db.execute("PRAGMA journal_mode=WAL")
+
         # --- Last.fm-side lookup caches (artist tags/listeners/top-tracks) ---
         self._artist_stats_cache = {}
         self._top_tracks_cache = {}
         self._tags_cache = {}
+        self._track_listeners_cache = {}
         self._artist_info_cache = {}
         self._cache_lock = threading.Lock()
 
@@ -515,6 +571,21 @@ class SongRadio:
         # and to keep total OS thread count bounded by lastfm_max_workers for
         # the whole run - both for real overhead and for readable profiler output.
         self._lastfm_executor = ThreadPoolExecutor(max_workers=lastfm_max_workers, thread_name_prefix="lastfm")
+        # A plain module-level requests.get(...) call opens and tears down a
+        # brand-new Session (and thus a brand-new connection pool) on every
+        # single call, forcing a fresh TCP+TLS handshake per request even
+        # though almost all Last.fm requests go to the same host. A single
+        # persistent Session with a pool sized to lastfm_max_workers lets
+        # concurrent requests reuse keep-alive connections instead. Sharing
+        # one Session across the executor's worker threads is safe here:
+        # urllib3's underlying connection pool (which is what actually
+        # matters for concurrent access) is internally thread-safe, and no
+        # per-request Session state (cookies, auth, etc.) is used.
+        self._lastfm_session = requests.Session()
+        pool_size = max(lastfm_max_workers, 10)  # never shrink below requests' own default
+        self._lastfm_session.mount(
+            "https://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=pool_size)
+        )
         self._lastfm_monitor = LastFmRequestMonitor(
             api_key=lastfm_api_key,
             window_size=lastfm_monitor_window,
@@ -570,7 +641,7 @@ class SongRadio:
             request_start = time.monotonic()
 
             try:
-                resp = requests.get(
+                resp = self._lastfm_session.get(
                     "https://ws.audioscrobbler.com/2.0/",
                     params={"method": method, "api_key": self.lastfm_api_key, "format": "json", **params},
                     timeout=5,
@@ -624,10 +695,128 @@ class SongRadio:
 
         return {}
 
+    # --- Persisted Last.fm cache (SQLite, survives across runs) ---------
+
+    def _load_persisted_artist_field(self, artist_name, field):
+        """Reads one persisted Last.fm artist field, honoring the cache TTL.
+
+        Args:
+            artist_name: Name of the artist.
+            field: One of "tags", "listeners", "top_tracks" (keys of
+                _ARTIST_FIELD_COLUMNS).
+
+        Returns:
+            For "tags"/"top_tracks": a list[str] (already JSON-decoded, in
+            the order originally fetched). For "listeners": an int, or
+            None if Last.fm genuinely had no listener count for this
+            artist (a legitimate cached outcome, not a miss). In all
+            cases, the module-level _CACHE_MISS sentinel is returned
+            instead if the artist was never cached, this particular field
+            was never populated, or the entry is older than
+            self.lastfm_cache_ttl_days.
+        """
+        value_col, ts_col = self._ARTIST_FIELD_COLUMNS[field]
+        with self._cache_lock:
+            row = self._lastfm_db.execute(
+                f"SELECT {value_col}, {ts_col} FROM lastfm_artists WHERE artist_name = ?", (artist_name,)
+            ).fetchone()
+        if row is None:
+            return _CACHE_MISS
+        value_raw, fetched_at = row
+        if fetched_at is None:
+            return _CACHE_MISS  # row exists (some other field was cached) but not this one
+        if self.lastfm_cache_ttl_days and (time.time() - fetched_at) / 86400 > self.lastfm_cache_ttl_days:
+            return _CACHE_MISS
+        if field == "listeners":
+            return value_raw
+        return json.loads(value_raw) if value_raw is not None else []
+
+    def _save_persisted_artist_field(self, artist_name, field, value):
+        """Upserts one persisted Last.fm artist field.
+
+        Only the given field's value/fetched_at columns are written - the
+        other two fields' columns (if already cached from a previous call)
+        are left untouched, since tags/listeners/top_tracks are fetched via
+        independent Last.fm API calls and may be populated at different
+        times (e.g. listeners in one batch pass, tags/top_tracks in a
+        later one - see _fetch_artist_infos_batch).
+
+        Args:
+            artist_name: Name of the artist.
+            field: One of "tags", "listeners", "top_tracks".
+            value: list[str] for "tags"/"top_tracks" (JSON-encoded before
+                storing); int or None for "listeners" (stored as-is).
+
+        Returns:
+            None.
+        """
+        value_col, ts_col = self._ARTIST_FIELD_COLUMNS[field]
+        stored = value if field == "listeners" else json.dumps(value)
+        with self._cache_lock:
+            self._lastfm_db.execute(
+                f"INSERT INTO lastfm_artists (artist_name, {value_col}, {ts_col}) VALUES (?, ?, ?) "
+                f"ON CONFLICT(artist_name) DO UPDATE SET {value_col}=excluded.{value_col}, {ts_col}=excluded.{ts_col}",
+                (artist_name, stored, time.time()),
+            )
+            self._lastfm_db.commit()
+
+    def _load_persisted_track_listeners(self, artist_name, track_name):
+        """Reads a persisted per-track Last.fm listener count.
+
+        Args:
+            artist_name: Name of the artist.
+            track_name: Title of the track.
+
+        Returns:
+            int, or None if Last.fm genuinely had no listener count for
+            this track (a legitimate cached outcome). The module-level
+            _CACHE_MISS sentinel is returned instead if this (artist,
+            track) pair was never cached or the entry has expired.
+        """
+        with self._cache_lock:
+            row = self._lastfm_db.execute(
+                "SELECT listeners, fetched_at FROM lastfm_tracks WHERE artist_name = ? AND track_name = ?",
+                (artist_name, track_name),
+            ).fetchone()
+        if row is None:
+            return _CACHE_MISS
+        listeners, fetched_at = row
+        if fetched_at is None:
+            return _CACHE_MISS
+        if self.lastfm_cache_ttl_days and (time.time() - fetched_at) / 86400 > self.lastfm_cache_ttl_days:
+            return _CACHE_MISS
+        return listeners
+
+    def _save_persisted_track_listeners(self, artist_name, track_name, listeners):
+        """Upserts a persisted per-track Last.fm listener count.
+
+        Args:
+            artist_name: Name of the artist.
+            track_name: Title of the track.
+            listeners: int, or None if Last.fm had no entry for this track.
+
+        Returns:
+            None.
+        """
+        with self._cache_lock:
+            self._lastfm_db.execute(
+                "INSERT INTO lastfm_tracks (artist_name, track_name, listeners, fetched_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(artist_name, track_name) DO UPDATE SET "
+                "listeners=excluded.listeners, fetched_at=excluded.fetched_at",
+                (artist_name, track_name, listeners, time.time()),
+            )
+            self._lastfm_db.commit()
+
     def lastfm_top_tags(self, artist_name, limit=8):
         """Fetches the most-assigned Last.fm tags (genre/style) for an artist.
 
-        Cached per (artist_name, limit) for the lifetime of the instance.
+        Checked in order: in-memory cache (lifetime of the instance) ->
+        persisted SQLite cache (survives across runs, see
+        _load_persisted_artist_field, subject to lastfm_cache_ttl_days) ->
+        live Last.fm request. A live fetch always retrieves and persists
+        PERSISTED_TAGS_LIMIT tags regardless of this call's `limit`, so a
+        later call with a different limit can still be served from the
+        cache instead of triggering another request.
 
         Args:
             artist_name: Name of the artist.
@@ -643,17 +832,30 @@ class SongRadio:
         if cached is not None:
             return cached
 
+        persisted = self._load_persisted_artist_field(artist_name, "tags")
+        if persisted is not _CACHE_MISS:
+            tags = persisted[:limit]
+            with self._cache_lock:
+                self._tags_cache[cache_key] = tags
+            return tags
+
         data = self._lastfm_get("artist.getTopTags", artist=artist_name)
         assert data is not None
         tags_raw = data.get("toptags", {}).get("tag", [])
-        tags = [t["name"].lower() for t in tags_raw[:limit] if t.get("name")]
+        all_tags = [t["name"].lower() for t in tags_raw[: self.PERSISTED_TAGS_LIMIT] if t.get("name")]
+        tags = all_tags[:limit]
 
+        self._save_persisted_artist_field(artist_name, "tags", all_tags)
         with self._cache_lock:
             self._tags_cache[cache_key] = tags
         return tags
 
     def lastfm_track_listeners(self, artist_name, track_name):
         """Fetches the listener count of a single track from Last.fm.
+
+        Checked in order: in-memory cache (lifetime of the instance) ->
+        persisted SQLite cache (survives across runs, subject to
+        lastfm_cache_ttl_days) -> live Last.fm request.
 
         Args:
             artist_name: Name of the artist.
@@ -663,15 +865,36 @@ class SongRadio:
             Number of listeners as an int, or None if no Last.fm entry was
             found or the request failed.
         """
+        cache_key = (artist_name, track_name)
+        with self._cache_lock:
+            cached = self._track_listeners_cache.get(cache_key, _CACHE_MISS)
+        if cached is not _CACHE_MISS:
+            return cached
+
+        persisted = self._load_persisted_track_listeners(artist_name, track_name)
+        if persisted is not _CACHE_MISS:
+            with self._cache_lock:
+                self._track_listeners_cache[cache_key] = persisted
+            return persisted
+
         data = self._lastfm_get("track.getInfo", artist=artist_name, track=track_name)
         assert data is not None
         try:
-            return int(data["track"]["listeners"])
+            listeners = int(data["track"]["listeners"])
         except (KeyError, ValueError, TypeError):
-            return None
+            listeners = None
+
+        self._save_persisted_track_listeners(artist_name, track_name, listeners)
+        with self._cache_lock:
+            self._track_listeners_cache[cache_key] = listeners
+        return listeners
 
     def lastfm_artist_listeners(self, artist_name):
         """Fetches an artist's total listener count from Last.fm (cached).
+
+        Checked in order: in-memory cache (lifetime of the instance) ->
+        persisted SQLite cache (survives across runs, subject to
+        lastfm_cache_ttl_days) -> live Last.fm request.
 
         Args:
             artist_name: Name of the artist.
@@ -679,11 +902,17 @@ class SongRadio:
         Returns:
             Total listener count as an int, or None if no Last.fm entry was
             found or the request failed. Results are cached per artist name
-            in self._artist_stats_cache.
+            in self._artist_stats_cache (and persisted to SQLite).
         """
         with self._cache_lock:
             if artist_name in self._artist_stats_cache:
                 return self._artist_stats_cache[artist_name]
+
+        persisted = self._load_persisted_artist_field(artist_name, "listeners")
+        if persisted is not _CACHE_MISS:
+            with self._cache_lock:
+                self._artist_stats_cache[artist_name] = persisted
+            return persisted
 
         data = self._lastfm_get("artist.getInfo", artist=artist_name)
         assert data is not None
@@ -692,12 +921,20 @@ class SongRadio:
         except (KeyError, ValueError, TypeError):
             listeners = None
 
+        self._save_persisted_artist_field(artist_name, "listeners", listeners)
         with self._cache_lock:
             self._artist_stats_cache[artist_name] = listeners
         return listeners
 
     def lastfm_artist_top_track_names(self, artist_name):
         """Fetches the names of an artist's most-listened to tracks (cached).
+
+        Checked in order: in-memory cache (lifetime of the instance) ->
+        persisted SQLite cache (survives across runs, subject to
+        lastfm_cache_ttl_days) -> live Last.fm request. A live fetch always
+        retrieves and persists PERSISTED_TOP_TRACKS_LIMIT names regardless
+        of this instance's artist_top_hit_exclude_n, so the cache stays
+        valid even if a later run uses a different value for it.
 
         Args:
             artist_name: Name of the artist.
@@ -712,11 +949,20 @@ class SongRadio:
             if artist_name in self._top_tracks_cache:
                 return self._top_tracks_cache[artist_name]
 
-        data = self._lastfm_get("artist.getTopTracks", artist=artist_name, limit=self.artist_top_hit_exclude_n)
+        persisted = self._load_persisted_artist_field(artist_name, "top_tracks")
+        if persisted is not _CACHE_MISS:
+            names = set(persisted[: self.artist_top_hit_exclude_n])
+            with self._cache_lock:
+                self._top_tracks_cache[artist_name] = names
+            return names
+
+        data = self._lastfm_get("artist.getTopTracks", artist=artist_name, limit=self.PERSISTED_TOP_TRACKS_LIMIT)
         assert data is not None
         tracks = data.get("toptracks", {}).get("track", [])
-        names = {t["name"].lower() for t in tracks if t.get("name")}
+        all_names = [t["name"].lower() for t in tracks if t.get("name")]
+        names = set(all_names[: self.artist_top_hit_exclude_n])
 
+        self._save_persisted_artist_field(artist_name, "top_tracks", all_names)
         with self._cache_lock:
             self._top_tracks_cache[artist_name] = names
         return names
@@ -724,12 +970,12 @@ class SongRadio:
     def _fetch_artist_info_one(self, artist_name):
         """Fetches and caches the bundle of Last.fm lookups for one artist.
 
-        Bundles the three per-artist lookups (tags, total listeners, top
-        tracks) used by filter_and_rank's cascade, and caches the bundle in
-        self._artist_info_cache so an artist is never looked up twice across
-        the whole run. Safe to call from multiple threads: each underlying
-        lookup already guards its own cache with self._cache_lock, and the
-        bundle write below does too.
+        Not used by the concurrent batch path anymore (see
+        _fetch_artist_infos_batch, which fetches listeners first and only
+        fetches tags/top_tracks for artists that pass min_artist_listeners,
+        flattened across the whole batch instead of bundled per artist).
+        Kept as a simple, self-contained helper for ad-hoc single-artist
+        lookups outside the batch machinery.
 
         Args:
             artist_name: Name of the artist.
@@ -761,7 +1007,17 @@ class SongRadio:
         count stays bounded by lastfm_max_workers for the whole run rather
         than growing with the number of batches. Concurrency below the
         pool's configured size (e.g. after an adaptive backoff) is achieved
-        by submitting in chunks, not by resizing the pool.
+        by keeping at most max_workers submissions in flight at once, not by
+        resizing the pool.
+
+        Uses a sliding window rather than discrete synchronized chunks: as
+        soon as any in-flight callable completes, the next not-yet-submitted
+        one is submitted immediately. A chunk-and-barrier approach (submit
+        max_workers, wait for ALL of them, then submit the next max_workers)
+        would leave up to max_workers-1 threads idle whenever one callable
+        in a chunk runs long, since no new work is handed out until the
+        entire chunk finishes - the sliding window keeps every free slot
+        continuously fed instead.
 
         Args:
             callables: List of zero-argument callables to run.
@@ -772,19 +1028,31 @@ class SongRadio:
             `callables`, each already completed.
         """
         futures: "list[Future | None]" = [None] * len(callables)
-        chunk_size = max(1, max_workers)
-        for start in range(0, len(callables), chunk_size):
-            chunk = callables[start : start + chunk_size]
-            future_to_idx = {self._lastfm_executor.submit(fn): start + i for i, fn in enumerate(chunk)}
-            for future in as_completed(future_to_idx):
-                futures[future_to_idx[future]] = future
-        # Every slot was filled above (one future per input callable across
-        # all chunks) - the None in the element type only existed to satisfy
-        # the initial placeholder list, not because a slot can stay empty.
+        pending = {}  # Future -> index into `futures`/`callables`
+        next_idx = 0
+
+        def submit_next():
+            nonlocal next_idx
+            if next_idx < len(callables):
+                fut = self._lastfm_executor.submit(callables[next_idx])
+                pending[fut] = next_idx
+                next_idx += 1
+
+        for _ in range(min(max(1, max_workers), len(callables))):
+            submit_next()
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                futures[pending.pop(future)] = future
+                submit_next()  # immediately refill the slot just freed
+        # Every slot was filled above (one future per input callable) - the
+        # None in the element type only existed to satisfy the initial
+        # placeholder list, not because a slot can stay empty.
         return cast("list[Future]", futures)
 
     def close(self):
-        """Shuts down the shared Last.fm thread pool and the search cache DB.
+        """Shuts down the shared Last.fm thread pool, HTTP session, and the
+        search cache DB.
 
         Not strictly required for a one-shot script (process exit cleans
         this up), but good hygiene if an instance is ever reused.
@@ -796,27 +1064,56 @@ class SongRadio:
             None.
         """
         self._lastfm_executor.shutdown(wait=True)
+        self._lastfm_session.close()
+        self._lastfm_db.close()
         self._search_db.close()
 
     def _fetch_artist_infos_batch(self, artist_names, max_workers):
         """Concurrently fetches Last.fm info for a batch of artists.
 
-        Last.fm has no multi-artist "batch" endpoint, so this fires up to
-        max_workers single-artist requests concurrently rather than one at a
-        time. Artists already present in self._artist_info_cache are
-        skipped entirely (no request made, no thread spent).
+        Last.fm has no multi-artist "batch" endpoint, so this fires
+        concurrent single-artist requests rather than one at a time.
+        Artists already present in self._artist_info_cache are skipped
+        entirely (no request made, no thread spent).
+
+        Runs in two flattened passes rather than bundling all three
+        per-artist lookups together (see the retired _fetch_artist_info_one):
+
+        1. Listener counts for every not-yet-cached artist, all submitted
+           together as one flat batch of independent tasks.
+        2. Tags + top-tracks, but ONLY for artists whose listener count
+           didn't already fail min_artist_listeners - a candidate that's
+           going to be excluded by the listener floor anyway never needs
+           its tags or top-tracks fetched. This pass is also flattened:
+           2 * len(survivors) independent tasks submitted together, rather
+           than len(survivors) tasks that each make two lookups back to
+           back in a single thread - so the shared executor's concurrency
+           ceiling is spent across artists, not tied up per artist.
+
+        Both passes call _run_concurrent directly from this (non-executor)
+        call site rather than from inside a task already running on
+        self._lastfm_executor - nesting _run_concurrent calls on the same
+        fixed-size executor would risk a deadlock (all worker threads
+        blocked waiting on sub-tasks submitted to that same, fully-occupied
+        pool, with no thread left free to run them).
 
         Args:
             artist_names: Iterable of artist names to fetch info for.
-            max_workers: Maximum number of concurrent requests for this
-                batch (the caller adapts this between batches based on
-                observed 429 rates).
+            max_workers: Maximum number of concurrent requests per pass
+                (the caller adapts this between batches based on observed
+                429 rates).
 
         Returns:
-            dict artist_name -> info dict (see _fetch_artist_info_one).
-            Artists whose fetch raised an exception get a safe empty-info
-            placeholder rather than being omitted, so downstream filtering
-            doesn't need special-casing for missing keys.
+            dict artist_name -> info dict with keys "tags" (set),
+            "listeners" (int or None), "top_tracks" (set). Artists that
+            fail min_artist_listeners get "tags"/"top_tracks" as empty
+            sets (never fetched) rather than omitted, so downstream
+            filtering doesn't need special-casing for missing keys. Note:
+            this means such artists no longer contribute their real tags
+            to callers that reuse this cache for purposes other than the
+            listener-gated filter cascade (e.g. build_candidate_pool's
+            genre-snowball expansion) - a low-listener artist that would
+            otherwise be a good genre match no longer feeds the snowball.
         """
         results = {}
         to_fetch = []
@@ -831,16 +1128,58 @@ class SongRadio:
         if not to_fetch:
             return results
 
-        futures = self._run_concurrent(
-            [(lambda n=name: self._fetch_artist_info_one(n)) for name in to_fetch],
+        # Pass 1: listener counts only - the cheapest lookup and the one
+        # with the most exclusionary power.
+        listener_futures = self._run_concurrent(
+            [(lambda n=name: self.lastfm_artist_listeners(n)) for name in to_fetch],
             max_workers=max_workers,
         )
-        for name, future in zip(to_fetch, futures):
+        listeners = {}
+        for name, future in zip(to_fetch, listener_futures):
             try:
-                results[name] = future.result()
+                listeners[name] = future.result()
             except Exception as e:
-                    logger.warning("Artist info fetch failed for %s: %s", name, e)
-                    results[name] = {"tags": set(), "listeners": None, "top_tracks": set()}
+                logger.warning("Artist listener fetch failed for %s: %s", name, e)
+                listeners[name] = None
+
+        # Same "unknown listeners aren't held against the artist" semantics
+        # as the original listener-floor check in filter_and_rank.
+        survivors = [
+            name for name in to_fetch
+            if listeners[name] is None or listeners[name] >= self.min_artist_listeners
+        ]
+
+        # Pass 2: tags + top-tracks, only for survivors, flattened together.
+        tags, top_tracks = {}, {}
+        if survivors:
+            tag_and_track_futures = self._run_concurrent(
+                [(lambda n=name: set(self.lastfm_top_tags(n, limit=20))) for name in survivors]
+                + [(lambda n=name: self.lastfm_artist_top_track_names(n)) for name in survivors],
+                max_workers=max_workers,
+            )
+            n = len(survivors)
+            for name, future in zip(survivors, tag_and_track_futures[:n]):
+                try:
+                    tags[name] = future.result()
+                except Exception as e:
+                    logger.warning("Artist tags fetch failed for %s: %s", name, e)
+                    tags[name] = set()
+            for name, future in zip(survivors, tag_and_track_futures[n:]):
+                try:
+                    top_tracks[name] = future.result()
+                except Exception as e:
+                    logger.warning("Artist top-tracks fetch failed for %s: %s", name, e)
+                    top_tracks[name] = set()
+
+        for name in to_fetch:
+            info = {
+                "tags": tags.get(name, set()),
+                "listeners": listeners[name],
+                "top_tracks": top_tracks.get(name, set()),
+            }
+            with self._cache_lock:
+                self._artist_info_cache[name] = info
+            results[name] = info
 
         return results
 
@@ -981,12 +1320,21 @@ class SongRadio:
         previous JSON-based format's cost scale with total accumulated
         history instead of with the current run's actual work.
 
+        Also creates the persisted Last.fm cache tables in the same file:
+        "lastfm_artists" (one row per artist, with separate value/fetched_at
+        column pairs for tags/listeners/top_tracks, so any subset of the
+        three can be populated or refreshed independently of the others)
+        and "lastfm_tracks" (per (artist, track) listener counts). These are
+        read and written through a SEPARATE connection (self._lastfm_db,
+        opened in __init__ with check_same_thread=False), since Last.fm
+        lookups run concurrently from the executor's worker threads unlike
+        everything else in this method, which stays main-thread-only.
+
         WAL journal mode is used so commits are fast and don't block reads
         from a concurrent process (e.g. inspecting the cache while a run is
-        in progress). This connection is only ever used from the main
-        thread - Spotify search/caching isn't parallelized, only the
-        Last.fm lookups are (see _run_concurrent) - so no locking around it
-        is needed.
+        in progress). This connection (the one returned here) is only ever
+        used from the main thread - Spotify search/caching isn't
+        parallelized - so no locking around it is needed.
 
         Args:
             cache_path: Path to the SQLite database file.
@@ -1007,6 +1355,19 @@ class SongRadio:
             "query TEXT NOT NULL, track_id TEXT NOT NULL, PRIMARY KEY (query, track_id))"
         )
         db.execute("CREATE INDEX IF NOT EXISTS idx_query_tracks_query ON query_tracks(query)")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS lastfm_artists ("
+            "artist_name TEXT PRIMARY KEY, "
+            "tags_json TEXT, tags_fetched_at REAL, "
+            "listeners INTEGER, listeners_fetched_at REAL, "
+            "top_tracks_json TEXT, top_tracks_fetched_at REAL)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS lastfm_tracks ("
+            "artist_name TEXT NOT NULL, track_name TEXT NOT NULL, "
+            "listeners INTEGER, fetched_at REAL, "
+            "PRIMARY KEY (artist_name, track_name))"
+        )
         db.commit()
         return db
 
@@ -1107,8 +1468,13 @@ class SongRadio:
         max_results is reached or Spotify returns an empty results page (end
         of the filtered database). Handles 429 responses: short wait times
         (<= RATE_LIMIT_AUTO_RETRY_THRESHOLD seconds) are waited out and the
-        offset retried; long/unknown wait times cause an immediate abort
-        (raise), so the lockout isn't extended by further requests.
+        offset retried. A 429 with no usable Retry-After header is retried a
+        small, bounded number of times (MAX_UNKNOWN_429_RETRIES) with a
+        short exponential backoff first - spotipy is known to mislabel a
+        transient run of 5xx responses (e.g. a brief Spotify-side 502 burst)
+        as an unknown-wait 429, and that case usually clears within one or
+        two quick retries. Only once that retry budget is exhausted does it
+        abort (raise), so the lockout isn't extended by further requests.
 
         Reuses previously cached results for this exact query (see
         self._search_db) instead of re-fetching them, and only issues live
@@ -1156,6 +1522,7 @@ class SongRadio:
             return collected
 
         offset = (max(state["offsets_fetched"]) + self.search_limit) if state["offsets_fetched"] else 0
+        unknown_429_retries = 0
         while offset < max_results and offset <= self._max_offset:
             try:
                 results = self.sp.search(q=query, type="track", limit=self.search_limit, offset=offset)
@@ -1176,6 +1543,22 @@ class SongRadio:
                         print(f"Short rate limit ({retry_after}s) - waiting and retrying...")
                         time.sleep(retry_after + 1)
                         continue
+                    if retry_after is None and unknown_429_retries < self.MAX_UNKNOWN_429_RETRIES:
+                        # No usable Retry-After at all (as opposed to a
+                        # long/known one) is what spotipy also reports for a
+                        # transient run of 5xx errors it gave up retrying
+                        # internally - not necessarily a genuine, sustained
+                        # rate limit. Give it a couple of short chances to
+                        # clear before treating it as the real thing.
+                        unknown_429_retries += 1
+                        wait_s = self.request_sleep * (2 ** unknown_429_retries)
+                        print(
+                            f"429 with no Retry-After (possibly a transient 5xx burst, not a real "
+                            f"rate limit) - short retry {unknown_429_retries}/{self.MAX_UNKNOWN_429_RETRIES} "
+                            f"in {wait_s:.1f}s..."
+                        )
+                        time.sleep(wait_s)
+                        continue
                     wait_msg = f"{retry_after}s" if retry_after is not None else f"unknown ({raw_retry})"
                     print(f"Rate limit reached (wait time: {wait_msg}) - aborting completely.")
                     self._save_query_state(query, state)  # persist progress made so far before hard-aborting
@@ -1191,6 +1574,7 @@ class SongRadio:
                 self._save_query_state(query, state)  # persist progress before abandoning this query
                 break
             time.sleep(self.request_sleep)
+            unknown_429_retries = 0  # this offset succeeded - a later burst gets its own fresh budget
             assert results is not None
             items = results.get("tracks", {}).get("items", [])
             state["offsets_fetched"].append(offset)
@@ -1320,8 +1704,12 @@ class SongRadio:
         def update_discovered_genres():
             """Folds Last.fm tags from any not-yet-processed candidate
             artists into discovered_genre_counter, for snowball expansion
-            once the original seed-derived genre list runs out. Reuses
-            _fetch_artist_infos_batch (same cache/executor as
+            once the original seed-derived genre list runs out. Only
+            artists with at least some genre overlap with the seeds
+            (_genre_similarity > 0) contribute their tags - otherwise a
+            single seed's genre neighborhood can snowball into completely
+            unrelated territory once ordinary co-occurrence is the only
+            gate. Reuses _fetch_artist_infos_batch (same cache/executor as
             filter_and_rank), so these lookups aren't wasted - they warm
             the cache for later instead of duplicating work."""
             pool_artists = {t["artists"][0]["name"] for t in current_pool()}
@@ -1332,6 +1720,12 @@ class SongRadio:
             blocklist_for_discovery = self.LASTFM_JUNK_TAGS | self.excluded_genres
             for artist_name, info in infos.items():
                 artists_with_discovered_tags.add(artist_name)
+                if self._genre_similarity(info["tags"]) <= 0:
+                    # No overlap at all with the seed genres - this artist's
+                    # tags are treated as unrelated noise and don't get to
+                    # seed new snowball genres, however often they co-occur
+                    # among candidate artists.
+                    continue
                 for tag in info["tags"]:
                     if tag not in blocklist_for_discovery:
                         discovered_genre_counter[tag] += 1
