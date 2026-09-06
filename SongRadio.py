@@ -45,6 +45,7 @@ from functools import lru_cache
 from typing import cast
 
 import requests
+from requests.adapters import HTTPAdapter
 import spotipy
 from langdetect import LangDetectException, detect
 from spotipy.oauth2 import SpotifyOAuth
@@ -633,7 +634,7 @@ class SongRadio:
         self._lastfm_session = requests.Session()
         pool_size = max(lastfm_max_workers, 10)  # never shrink below requests' own default
         self._lastfm_session.mount(
-            "https://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=pool_size)
+            "https://", HTTPAdapter(pool_connections=1, pool_maxsize=pool_size)
         )
         self._lastfm_monitor = LastFmRequestMonitor(
             api_key=lastfm_api_key,
