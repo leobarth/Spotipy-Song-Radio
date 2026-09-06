@@ -309,6 +309,36 @@ class SongRadio:
     RATE_LIMIT_AUTO_RETRY_THRESHOLD = 30  # seconds - above this: abort immediately instead of waiting
     MAX_UNKNOWN_429_RETRIES = 2  # short retries for a 429 with no usable Retry-After before hard-aborting
 
+    # Fast pre-checks used by is_allowed_language before falling back to the
+    # full langdetect model (the actual cost driver there - its n-gram
+    # profiling runs regardless of how obvious the answer is). Each check
+    # only ever returns a confident True/False; anything less clear-cut
+    # defers to the full model, so accuracy for ambiguous titles is
+    # unchanged - this only skips the model for cases cheap evidence
+    # already settles.
+    _NON_LATIN_SCRIPT_RE = re.compile(
+        "[\u0400-\u04FF\u0370-\u03FF\u0590-\u05FF\u0600-\u06FF"   # Cyrillic, Greek, Hebrew, Arabic
+        "\u0900-\u097F\u0E00-\u0E7F\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7A3]"  # Devanagari, Thai, Kana/CJK, Hangul
+    )
+    # Languages whose script falls in the ranges above (i.e. not
+    # expressible in near-pure Latin script). A title dominated by one of
+    # those scripts can only be confidently *rejected* without running the
+    # full model if none of allowed_languages could plausibly be it.
+    _NON_LATIN_LANGUAGES = {
+        "ru", "uk", "bg", "sr", "el", "he", "yi", "ar", "fa", "ur",
+        "hi", "mr", "ne", "th", "ja", "zh", "zh-cn", "zh-tw", "ko",
+    }
+    # Very common, near-unambiguous words for the languages this system is
+    # actually configured with in practice. A match lets a title be
+    # accepted without running the full model; a miss just falls through
+    # to it - so this can only ever be too permissive, in the same
+    # direction the "too short/uncertain -> let it through" exception
+    # handler below already is, never too strict.
+    _STOPWORD_PATTERNS = {
+        "en": re.compile(r"\b(the|and|you|your|love|with|for|of|in|on|to|me|my|we)\b", re.IGNORECASE),
+        "de": re.compile(r"\b(und|nicht|ich|der|die|das|mit|für|auf|ist|ein|eine|kein|dich|mich|wir)\b", re.IGNORECASE),
+    }
+
     # Persisted Last.fm cache: always fetch/store this many tags/top-tracks
     # regardless of what a given call site's `limit` or instance's
     # artist_top_hit_exclude_n happens to be, and slice locally on read -
@@ -1202,9 +1232,50 @@ class SongRadio:
 
         return results
 
+    @classmethod
+    def _fast_language_hint(cls, text, allowed_languages):
+        """Cheap pre-check for is_allowed_language, before the full model.
+
+        Args:
+            text: Text to check (e.g. a song title).
+            allowed_languages: Set of allowed language codes.
+
+        Returns:
+            True or False for a confident allow/deny decision, or None if
+            the text isn't clear-cut enough - the caller should fall back
+            to the full langdetect model in that case.
+        """
+        letters = sum(1 for c in text if c.isalpha())
+        if letters < 4:
+            return None  # too short to trust any shortcut either way
+
+        non_latin = len(cls._NON_LATIN_SCRIPT_RE.findall(text))
+        if non_latin / letters > 0.5:
+            # Dominated by a non-Latin script - only a confident rejection
+            # if none of the allowed languages could plausibly use it.
+            if not (allowed_languages & cls._NON_LATIN_LANGUAGES):
+                return False
+            return None
+
+        for lang in allowed_languages:
+            pattern = cls._STOPWORD_PATTERNS.get(lang)
+            if pattern and pattern.search(text):
+                return True
+
+        return None
+
     @lru_cache(maxsize=None)
     def is_allowed_language(self, text, allowed_languages):
         """Checks via best-effort language detection whether a text is allowed.
+
+        Tries a few cheap heuristics first (see _fast_language_hint) -
+        script-mismatch rejection and common-word matching - before
+        falling back to the full langdetect model, which profiles
+        character n-grams regardless of how obvious the answer already is
+        and is the actual cost driver here. The heuristics only ever
+        return a confident answer; anything ambiguous still goes through
+        the exact same detect()-based path as before, so accuracy for
+        genuinely uncertain titles is unchanged.
 
         Args:
             text: Text to check (e.g. a song title).
@@ -1215,6 +1286,9 @@ class SongRadio:
             or detection fails (a too-short/uncertain text is let through
             rather than falsely blocked). Otherwise False.
         """
+        hint = self._fast_language_hint(text, allowed_languages)
+        if hint is not None:
+            return hint
         try:
             return detect(text) in allowed_languages
         except LangDetectException:
