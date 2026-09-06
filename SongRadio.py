@@ -38,6 +38,7 @@ import sqlite3
 import difflib
 import threading
 import time
+import enum
 from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from functools import lru_cache
@@ -50,11 +51,29 @@ from spotipy.oauth2 import SpotifyOAuth
 
 logger = logging.getLogger("song_radio.lastfm")
 
-# Distinguishes "not cached / never fetched / expired" from a legitimately
-# cached value of None (e.g. an artist Last.fm genuinely has no listener
-# count for) in the persisted Last.fm cache - see
-# SongRadio._load_persisted_artist_field / _load_persisted_track_listeners.
-_CACHE_MISS = object()
+
+class _CacheMiss(enum.Enum):
+    """Sentinel type for "not cached / never fetched / expired" in the
+    persisted Last.fm cache, distinct from a legitimately cached value of
+    None (e.g. an artist Last.fm genuinely has no listener count for) -
+    see SongRadio._load_persisted_artist_field /
+    _load_persisted_track_listeners.
+
+    A dedicated Enum rather than a plain object() sentinel: every Python
+    value is an instance of `object`, so `isinstance(x, object)` is always
+    True regardless of what `x` actually is - not a usable type guard, and
+    the reason a plain `object()` sentinel can trip IDE/type-checker
+    warnings (the checker can't narrow `x` away from bare `object` after
+    an `is not _CACHE_MISS` check, so it still looks like `object` -
+    which has no __getitem__ - even though at runtime it's a list/int/None
+    by that point). Enum members are singletons that type checkers like
+    Pyright specifically recognize for `is`/`is not` narrowing, so this
+    fixes the warning at its root instead of suppressing it.
+    """
+    TOKEN = enum.auto()
+
+
+_CACHE_MISS = _CacheMiss.TOKEN
 
 
 class LastFmRequestMonitor:
@@ -834,7 +853,6 @@ class SongRadio:
 
         persisted = self._load_persisted_artist_field(artist_name, "tags")
         if persisted is not _CACHE_MISS:
-            assert not isinstance(persisted, object)
             tags = persisted[:limit]
             with self._cache_lock:
                 self._tags_cache[cache_key] = tags
@@ -952,7 +970,6 @@ class SongRadio:
 
         persisted = self._load_persisted_artist_field(artist_name, "top_tracks")
         if persisted is not _CACHE_MISS:
-            assert not isinstance(persisted, object)
             names = set(persisted[: self.artist_top_hit_exclude_n])
             with self._cache_lock:
                 self._top_tracks_cache[artist_name] = names
@@ -1652,11 +1669,21 @@ class SongRadio:
             (artist, normalized title) key.
         """
         candidates = {}  # dedup_key -> track
+        # Real candidate count, kept separate from len(candidates): the
+        # dict also holds one None placeholder per seed track (added just
+        # below, so a seed can never be re-added as its own "candidate"),
+        # and those placeholders must NOT count toward
+        # target_total_candidates - counting len(candidates) directly here
+        # used to make the stopping condition fire len(seed_tracks) short
+        # of the requested target every time (off by exactly the number of
+        # seeds, e.g. -1 for a single seed, -2 for two, etc.).
+        candidate_count = 0
         fresh_track_ids = set()  # track IDs obtained via a live Spotify request this run
         discovered_genre_counter = Counter()  # tags seen on candidate artists, for snowball expansion
         artists_with_discovered_tags = set()  # avoids double-counting an artist's tags across rounds
 
         def add_track(track):
+            nonlocal candidate_count
             if not track or not track.get("id"):
                 return
             artist_name = track["artists"][0]["name"]
@@ -1668,6 +1695,7 @@ class SongRadio:
             if not self.is_allowed_language(track["name"], frozenset(self.allowed_languages)):
                 return
             candidates[key] = track
+            candidate_count += 1
 
         def fetch_round_robin(query_to_artist, per_query_cap):
             """Cycles through queries, requesting results_per_turn new
@@ -1675,16 +1703,16 @@ class SongRadio:
             at its per_query_cap, or target_total_candidates is reached."""
             requested = {q: 0 for q in query_to_artist}
             active = set(query_to_artist)
-            while active and len(candidates) < self.target_total_candidates:
+            while active and candidate_count < self.target_total_candidates:
                 for q in list(active):
-                    if len(candidates) >= self.target_total_candidates:
+                    if candidate_count >= self.target_total_candidates:
                         break
                     target = min(requested[q] + self.results_per_turn, per_query_cap)
                     results = self._paginated_search(q, target, fresh_ids=fresh_track_ids)
                     requested[q] = target
                     artist_name = query_to_artist[q]
                     for track in results:
-                        if len(candidates) >= self.target_total_candidates:
+                        if candidate_count >= self.target_total_candidates:
                             break
                         if artist_name and not any(
                             a["name"].lower() == artist_name.lower() for a in track["artists"]
@@ -1783,7 +1811,7 @@ class SongRadio:
         while (
             expansion_round < self.max_candidate_expansion_rounds
             and (
-                len(current_pool()) < self.target_total_candidates
+                candidate_count < self.target_total_candidates
                 or fresh_fraction(current_pool()) < self.min_fresh_fraction
             )
         ):
