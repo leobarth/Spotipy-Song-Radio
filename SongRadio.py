@@ -348,6 +348,11 @@ class SongRadio:
     # larger limit is requested than what was originally cached.
     PERSISTED_TAGS_LIMIT = 50
     PERSISTED_TOP_TRACKS_LIMIT = 20
+    # Similar-artist list from Last.fm's own collaborative-filtering
+    # signal (artist.getSimilar) - always fetch/store this many regardless
+    # of the run's lastfm_similar_artist_count/thin_tag_similar_artist_count,
+    # for the same cache-reusability reason as the two limits above.
+    PERSISTED_SIMILAR_LIMIT = 30
     # Maps a logical artist-info field to its (value_column, fetched_at_column)
     # pair in the lastfm_artists table - see _load_persisted_artist_field /
     # _save_persisted_artist_field. Internal, fixed set of keys only (never
@@ -357,6 +362,7 @@ class SongRadio:
         "tags": ("tags_json", "tags_fetched_at"),
         "listeners": ("listeners", "listeners_fetched_at"),
         "top_tracks": ("top_tracks_json", "top_tracks_fetched_at"),
+        "similar": ("similar_json", "similar_fetched_at"),
     }
 
     def __init__(
@@ -378,10 +384,17 @@ class SongRadio:
         results_per_turn: int = 10,
         max_results_per_genre: int = 300,
         max_results_per_seed_artist: int = 200,
+        max_results_per_similar_artist: int = 15,
         target_total_candidates: int = 150,
         min_fresh_fraction: float = 0.2,
         max_candidate_expansion_rounds: int = 5,
         min_discovered_genre_count: int = 2,
+        # --- Last.fm similar-artist discovery & scoring ---
+        lastfm_similar_artist_count: int = 8,
+        thin_tag_genre_threshold: int = 4,
+        thin_tag_similar_artist_count: int = 25,
+        similarity_blend_weight_range: tuple = (0.2, 0.5),
+        popularity_bias: float = 0.0,
         # --- Filtering thresholds ---
         min_artist_listeners: int = 1_000,
         lastfm_listener_ceiling: int = 150_000,
@@ -434,6 +447,12 @@ class SongRadio:
             max_results_per_genre: Upper bound on search results per genre query.
             max_results_per_seed_artist: Upper bound on search results per
                 seed artist query.
+            max_results_per_similar_artist: Upper bound on search results
+                per query for an artist discovered via
+                lastfm_similar_artist_count/thin_tag_similar_artist_count
+                (see _ensure_seed_similar_artists). Kept smaller than
+                max_results_per_seed_artist by default since there are
+                typically many more similar artists than seeds.
             target_total_candidates: Desired candidate pool size.
                 build_candidate_pool treats this as a target to actively
                 work toward - if the initial genre/seed-artist search comes
@@ -461,6 +480,49 @@ class SongRadio:
                 found via a genre/artist search relevant to the seeds, a
                 tag repeatedly co-occurring among them is a meaningfully
                 related sub-genre rather than a one-off/noise tag.
+            lastfm_similar_artist_count: Number of Last.fm
+                collaborative-filtering "similar artists" (artist.getSimilar)
+                fetched per seed artist and used as a third candidate-search
+                source in build_candidate_pool, alongside genre search and
+                the seed artists' own catalogs - a signal independent of
+                tag/genre data, since it comes from Last.fm's own listening
+                co-occurrence graph. One Last.fm request per seed artist
+                regardless of this count (cached like every other Last.fm
+                lookup here), so raising it doesn't add API calls, only
+                more Spotify search queries within the existing
+                target_total_candidates budget.
+            thin_tag_genre_threshold: If the seed(s)' own Last.fm tags
+                number fewer than this after blocklist filtering (e.g. a
+                regional/dialect act with sparse tagging, where genre
+                search and its snowball expansion have structurally little
+                to work with), thin_tag_similar_artist_count is used
+                instead of lastfm_similar_artist_count - leaning candidate
+                discovery more heavily on the collaborative signal exactly
+                where the tag-based one is weakest.
+            thin_tag_similar_artist_count: See thin_tag_genre_threshold.
+            similarity_blend_weight_range: (min, max) range a blend weight
+                is sampled from, once per filter_and_rank run (not per
+                candidate, so scoring stays internally consistent within a
+                run while still varying run to run), and used to blend
+                Last.fm's artist.getSimilar "match" score into a
+                candidate's similarity score wherever its artist appears
+                in a seed's similar-artist list: `similarity = (1-w)*tag_
+                jaccard + w*lastfm_match`. Candidates whose artist isn't in
+                that list keep pure tag-Jaccard similarity, unaffected.
+                Sampling the weight per run (rather than fixing it) adds a
+                bit of deliberate run-to-run result variety on top of the
+                existing randomized genre sampling.
+            popularity_bias: Steers final ranking toward more (positive) or
+                less (negative) popular tracks, based on each candidate's
+                percentile rank in track listeners *within this run's
+                scored pool* (not a fixed absolute threshold, so it scales
+                sensibly across genres/pools with very different absolute
+                popularity levels). 0 (default) leaves ranking unaffected.
+                Applied as a pure post-processing step on already-fetched
+                data - no extra API calls. Practical useful range is
+                roughly -0.3 to 0.3; larger magnitudes increasingly
+                override genre/collaborative similarity rather than
+                nudging it.
             min_artist_listeners: Minimum total listener count an artist must
                 have on Last.fm to be considered a candidate.
             lastfm_listener_ceiling: Maximum listener count a single track may
@@ -563,10 +625,21 @@ class SongRadio:
         self.results_per_turn = results_per_turn
         self.max_results_per_genre = max_results_per_genre
         self.max_results_per_seed_artist = max_results_per_seed_artist
+        self.max_results_per_similar_artist = max_results_per_similar_artist
         self.target_total_candidates = target_total_candidates
         self.min_fresh_fraction = min_fresh_fraction
         self.max_candidate_expansion_rounds = max_candidate_expansion_rounds
         self.min_discovered_genre_count = min_discovered_genre_count
+
+        # --- Last.fm similar-artist discovery & scoring ---
+        self.lastfm_similar_artist_count = lastfm_similar_artist_count
+        self.thin_tag_genre_threshold = thin_tag_genre_threshold
+        self.thin_tag_similar_artist_count = thin_tag_similar_artist_count
+        self.similarity_blend_weight_range = similarity_blend_weight_range
+        self.popularity_bias = popularity_bias
+        self._similar_artists_cache = {}  # in-memory: (artist_name, limit) -> list[(name, match)]
+        self._similar_artist_pool_names = None  # populated once by _ensure_seed_similar_artists
+        self.seed_similar_match = {}  # lowercased artist name -> best Last.fm match score across seeds
 
         # --- Filtering thresholds ---
         self.min_artist_listeners = min_artist_listeners
@@ -1017,6 +1090,66 @@ class SongRadio:
             self._top_tracks_cache[artist_name] = names
         return names
 
+    def lastfm_similar_artists(self, artist_name, limit=20):
+        """Fetches Last.fm's collaborative-filtering similar-artist list.
+
+        This is Last.fm's own artist.getSimilar signal - built from
+        listening co-occurrence across Last.fm users, not from tags/genre
+        metadata - used as an independent candidate-discovery and scoring
+        signal (see _ensure_seed_similar_artists) that doesn't depend on
+        an artist having rich genre tagging.
+
+        Checked in order: in-memory cache (lifetime of the instance) ->
+        persisted SQLite cache (survives across runs, subject to
+        lastfm_cache_ttl_days) -> live Last.fm request. A live fetch
+        always retrieves and persists PERSISTED_SIMILAR_LIMIT entries
+        regardless of this call's `limit`, so the cache stays valid across
+        calls/runs that ask for different limits.
+
+        Args:
+            artist_name: Name of the artist.
+            limit: Maximum number of similar artists returned.
+
+        Returns:
+            List of (name, match) tuples, name as returned by Last.fm
+            (not lowercased - callers that need case-insensitive lookups
+            should lower() it themselves) and match a float in [0, 1],
+            ordered by descending match. Empty list if no data was found
+            or the request failed.
+        """
+        cache_key = (artist_name, limit)
+        with self._cache_lock:
+            cached = self._similar_artists_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        persisted = self._load_persisted_artist_field(artist_name, "similar")
+        if persisted is not _CACHE_MISS:
+            similar = [tuple(entry) for entry in persisted[:limit]]
+            with self._cache_lock:
+                self._similar_artists_cache[cache_key] = similar
+            return similar
+
+        data = self._lastfm_get("artist.getSimilar", artist=artist_name, limit=self.PERSISTED_SIMILAR_LIMIT)
+        assert data is not None
+        raw = data.get("similarartists", {}).get("artist", [])
+        all_similar = []
+        for a in raw[: self.PERSISTED_SIMILAR_LIMIT]:
+            name = a.get("name")
+            if not name:
+                continue
+            try:
+                match = float(a.get("match", 0.0))
+            except (TypeError, ValueError):
+                match = 0.0
+            all_similar.append([name, match])
+
+        self._save_persisted_artist_field(artist_name, "similar", all_similar)
+        similar = [tuple(entry) for entry in all_similar[:limit]]
+        with self._cache_lock:
+            self._similar_artists_cache[cache_key] = similar
+        return similar
+
     def _fetch_artist_info_one(self, artist_name):
         """Fetches and caches the bundle of Last.fm lookups for one artist.
 
@@ -1400,6 +1533,78 @@ class SongRadio:
         self.seed_genre_set = set(genre_counter)
         return artist_ids, genre_counter
 
+    def _ensure_seed_similar_artists(self):
+        """Fetches Last.fm's similar-artist lists for the seed artists, once.
+
+        Populates two pieces of state used by build_candidate_pool and
+        filter_and_rank:
+          - self._similar_artist_pool_names: deduped list of similar-artist
+            names, used as a third candidate-search source in
+            build_candidate_pool (alongside genre search and the seed
+            artists' own catalogs) - searching Spotify for tracks by
+            artists Last.fm's community associates with the seed(s), a
+            signal independent of genre/tag data.
+          - self.seed_similar_match: lowercased artist name -> highest
+            Last.fm match score across all seed artists' similar-lists,
+            used in filter_and_rank to blend into the tag-based similarity
+            score (see similarity_blend_weight_range).
+
+        Idempotent (checks self._similar_artist_pool_names is not None) so
+        it's safe to call at the top of build_candidate_pool every time
+        without redoing the work if called more than once on the same
+        instance.
+
+        Cost: exactly one Last.fm request per seed artist (cached like
+        every other Last.fm lookup here - a repeat run or overlapping
+        seeds costs nothing extra), regardless of
+        lastfm_similar_artist_count/thin_tag_similar_artist_count, since
+        those only affect how much of the single cached response is used.
+
+        If the seeds' own Last.fm tags are thin after blocklist filtering
+        (fewer than thin_tag_genre_threshold - the same situation that
+        leaves genre search and its snowball expansion with structurally
+        little to work with, e.g. a regional/dialect act with sparse
+        tagging), thin_tag_similar_artist_count is used instead of
+        lastfm_similar_artist_count, leaning candidate discovery more
+        heavily on this collaborative signal precisely where the
+        tag-based one is weakest.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        if self._similar_artist_pool_names is not None:
+            return
+
+        blocklist = self.LASTFM_JUNK_TAGS | self.excluded_genres
+        usable_seed_tags = {g for g in self.seed_genre_set if g not in blocklist}
+        thin_tags = len(usable_seed_tags) < self.thin_tag_genre_threshold
+        count = self.thin_tag_similar_artist_count if thin_tags else self.lastfm_similar_artist_count
+
+        pool_names = []
+        seen_lower = set()
+        match_by_artist = {}
+        for seed_artist in self.seed_artist_names:
+            for name, match in self.lastfm_similar_artists(seed_artist, limit=count):
+                name_lower = name.lower()
+                if name_lower not in match_by_artist or match > match_by_artist[name_lower]:
+                    match_by_artist[name_lower] = match
+                if name_lower not in seen_lower and name_lower not in self.excluded_artists:
+                    seen_lower.add(name_lower)
+                    pool_names.append(name)
+            time.sleep(self.request_sleep)
+
+        self._similar_artist_pool_names = pool_names
+        self.seed_similar_match = match_by_artist
+        if thin_tags:
+            print(
+                f"Thin tag coverage for seed(s) ({len(usable_seed_tags)} usable tag(s)) - "
+                f"leaning on Last.fm similar-artist discovery ({count} per seed, "
+                f"{len(pool_names)} unique artists) instead of genre search."
+            )
+
     @staticmethod
     def _init_search_db(cache_path):
         """Opens (creating if needed) the SQLite search-cache database.
@@ -1456,6 +1661,20 @@ class SongRadio:
             "listeners INTEGER, listeners_fetched_at REAL, "
             "top_tracks_json TEXT, top_tracks_fetched_at REAL)"
         )
+        # Migration for databases created before similar_json/
+        # similar_fetched_at existed: CREATE TABLE IF NOT EXISTS is a
+        # no-op on an already-existing table, so an older lastfm_artists
+        # table needs these two columns added explicitly, or every
+        # lastfm_similar_artists lookup against an existing cache file
+        # would fail with "no such column". ADD COLUMN defaults new rows'
+        # existing entries to NULL, which _load_persisted_artist_field
+        # already treats as "never fetched" - exactly the desired
+        # behavior for data that predates this feature.
+        existing_cols = {row[1] for row in db.execute("PRAGMA table_info(lastfm_artists)").fetchall()}
+        if "similar_json" not in existing_cols:
+            db.execute("ALTER TABLE lastfm_artists ADD COLUMN similar_json TEXT")
+        if "similar_fetched_at" not in existing_cols:
+            db.execute("ALTER TABLE lastfm_artists ADD COLUMN similar_fetched_at REAL")
         db.execute(
             "CREATE TABLE IF NOT EXISTS lastfm_tracks ("
             "artist_name TEXT NOT NULL, track_name TEXT NOT NULL, "
@@ -1695,19 +1914,24 @@ class SongRadio:
         return collected
 
     def build_candidate_pool(self, genre_counter):
-        """Gathers candidate tracks via genre and seed artist search.
+        """Gathers candidate tracks via genre, seed artist, and similar-artist search.
 
-        Combines two sources, each fetched round-robin (results_per_turn new
-        results per query per turn, cycling through queries) so that no
-        single genre or seed artist drains its full budget before the others
-        get a turn: (1) search by a random sample of genres_to_use genres
-        drawn from the genres_to_use * genre_pool_multiplier most specific
-        genres in genre_counter, for diversity across other artists and
-        across runs; (2) a targeted search for the seed artists themselves,
-        to weight their catalog (deep cuts) more heavily. Deduplicates via
-        (artist, normalized title) so different versions of the same song
-        don't appear multiple times, and excludes the seed tracks themselves
-        as well as excluded_artists / disallowed languages.
+        Combines three sources, each fetched round-robin (results_per_turn
+        new results per query per turn, cycling through queries) so that no
+        single genre/artist drains its full budget before the others get a
+        turn: (1) search by a random sample of genres_to_use genres drawn
+        from the genres_to_use * genre_pool_multiplier most specific genres
+        in genre_counter, for diversity across other artists and across
+        runs; (2) a targeted search for the seed artists themselves, to
+        weight their catalog (deep cuts) more heavily; (3) a targeted
+        search for artists on the seed(s)' Last.fm similar-artist list
+        (see _ensure_seed_similar_artists) - a collaborative-filtering
+        signal independent of genre/tag data, which automatically gets
+        leaned on more heavily when the seeds' own tags are too thin for
+        genre search to work well. Deduplicates via (artist, normalized
+        title) so different versions of the same song don't appear
+        multiple times, and excludes the seed tracks themselves as well as
+        excluded_artists / disallowed languages.
 
         target_total_candidates and min_fresh_fraction are treated as goals
         to actively work toward rather than passive caps: when sampling
@@ -1871,7 +2095,20 @@ class SongRadio:
             self.max_results_per_seed_artist,
         )
 
-        # 3) Expansion rounds: if the initial search left the pool short of
+        # 3) Last.fm's own collaborative-filtering similar-artist list for
+        # the seed(s) (see _ensure_seed_similar_artists) - a discovery
+        # signal independent of genre/tag data, and one that automatically
+        # leans harder on this source instead of genre search when the
+        # seeds' own tags are too thin for genre search/snowball expansion
+        # to work well (e.g. a regional or dialect act).
+        self._ensure_seed_similar_artists()
+        if self._similar_artist_pool_names:
+            fetch_round_robin(
+                {f'artist:"{a}"': a for a in self._similar_artist_pool_names},
+                self.max_results_per_similar_artist,
+            )
+
+        # 4) Expansion rounds: if the initial search left the pool short of
         # target_total_candidates or min_fresh_fraction, reach for genres
         # that haven't been tried yet this run instead of quietly returning
         # less than asked for. Starts with the remaining seed-derived
@@ -1939,6 +2176,45 @@ class SongRadio:
         union_size = len(self.seed_genre_set) + len(artist_tags) - len(intersection)
         return len(intersection) / union_size if union_size else 0.0
 
+    def _apply_popularity_bias(self, scored):
+        """Nudges similarity scores toward more/less popular tracks.
+
+        Pure post-processing on data already fetched during scoring (no
+        extra API calls): each candidate's track-listener count is turned
+        into a percentile rank *within this run's scored pool* - not
+        against a fixed absolute threshold, so the adjustment scales
+        sensibly whether the pool's tracks have a few thousand or several
+        million listeners (an underground genre's "popular" track can
+        have far fewer listeners than a mainstream genre's obscure one,
+        so a fixed cutoff would behave very differently across seeds).
+
+        Args:
+            scored: List of score dicts as built in filter_and_rank (each
+                already has "track_listeners" and "similarity"). Mutated
+                in place.
+
+        Returns:
+            None.
+        """
+        if self.popularity_bias == 0 or not scored:
+            return
+
+        known = [s for s in scored if s["track_listeners"] is not None]
+        if len(known) < 2:
+            return  # not enough spread in this pool to rank meaningfully
+
+        known.sort(key=lambda s: s["track_listeners"])
+        n = len(known)
+        for i, s in enumerate(known):
+            percentile = i / (n - 1)  # 0 = least popular in this pool, 1 = most popular
+            # Centered on 0: negative percentile-0.5 (below-median
+            # popularity) combined with a negative popularity_bias
+            # (favoring hidden gems) pushes similarity up, and the
+            # symmetric case does too - either "wanting popular" paired
+            # with an actually-popular track, or "wanting obscure" paired
+            # with an actually-obscure one, gets rewarded.
+            s["similarity"] = max(0.0, min(1.0, s["similarity"] + self.popularity_bias * (percentile - 0.5) * 2))
+
     def filter_and_rank(self, candidates):
         """Filters candidates and ranks them by genre similarity to the seeds.
 
@@ -1955,7 +2231,17 @@ class SongRadio:
         gathers up to result_limit * similarity_oversample_factor of them,
         scores each by Jaccard similarity (see _genre_similarity) between its
         artist's Last.fm tags and self.seed_genre_set, and keeps the
-        result_limit most similar ones.
+        result_limit most similar ones. Wherever a candidate's artist
+        appears on a seed's Last.fm similar-artist list (see
+        _ensure_seed_similar_artists), that collaborative-filtering match
+        score is blended in: `similarity = (1-w)*tag_jaccard + w*match`,
+        with w sampled once per call from similarity_blend_weight_range
+        (not per candidate, so scoring stays internally consistent within
+        this run while still adding run-to-run result variety). After all
+        candidates are scored, popularity_bias (if nonzero) nudges scores
+        toward more/less popular tracks based on percentile rank within
+        this run's scored pool (see _apply_popularity_bias) - pure
+        post-processing, no extra requests.
 
         Candidates are processed in windowed batches (self.lastfm_batch_size
         tracks at a time) rather than one at a time or all at once: within a
@@ -1981,6 +2267,16 @@ class SongRadio:
         """
         pool = list(candidates)
         random.shuffle(pool)
+
+        # Idempotent - a no-op if build_candidate_pool already populated
+        # this (the normal pipeline order), but makes filter_and_rank
+        # robust to being called on its own too.
+        self._ensure_seed_similar_artists()
+        # Sampled once for the whole run (not per candidate) so scoring
+        # stays internally consistent across all candidates while still
+        # varying run to run - a deliberate bit of extra result jitter on
+        # top of the existing randomized genre sampling.
+        blend_weight = random.uniform(*self.similarity_blend_weight_range)
 
         oversample_target = self.result_limit * self.similarity_oversample_factor
         scored = []
@@ -2042,7 +2338,12 @@ class SongRadio:
                 if track_listeners is not None and track_listeners < self.min_track_listeners:
                     continue
 
-                similarity = self._genre_similarity(info["tags"])
+                tag_similarity = self._genre_similarity(info["tags"])
+                lastfm_match = self.seed_similar_match.get(track["artists"][0]["name"].lower())
+                if lastfm_match is not None:
+                    similarity = (1 - blend_weight) * tag_similarity + blend_weight * lastfm_match
+                else:
+                    similarity = tag_similarity
                 scored.append({
                     "track": track,
                     "track_listeners": track_listeners,
@@ -2068,6 +2369,7 @@ class SongRadio:
                     workers += 1
                     consecutive_clean_batches = 0
 
+        self._apply_popularity_bias(scored)
         scored.sort(key=lambda p: p["similarity"], reverse=True)
         picks = scored[: self.result_limit]
 
