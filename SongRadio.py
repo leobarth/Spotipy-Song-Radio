@@ -304,6 +304,18 @@ class SongRadio:
         r"\s*-\s*instrumental.*$", r"\s*\(instrumental\)",
         r"\s*\(explicit\)", r"\s*\(clean\)",
         r"\s*\(feat\..*?\)", r"\s*\(with .*?\)",
+        # Generic catch-all for named/edited re-issues of the same
+        # recording that don't match one of the exact phrases above -
+        # "Single Edit" (vs. the "single version" phrase already covered),
+        # "Special Edition", "<Producer Name> Album Mix", "<Anything>
+        # Radio Mix", etc. \b...\b keeps this from matching inside a
+        # longer word (so "Remix", "Mixed", "Versions" are untouched -
+        # e.g. a named remix like "- PNAU Remix" is left as its own
+        # distinct entry, only a bare trailing "mix"/"edit"/"version"/
+        # "edition" (optionally with arbitrary words in front, as long as
+        # there's no further " - " in between) triggers this.
+        r"\s*-\s*[^-]*\b(?:edit|mix|version|edition|anniversary|extended|demo|reissue|expanded|alternate)\b.*$",
+        r"\s*\([^()]*\b(?:edit|mix|version|edition|anniversary|extended|demo|reissue|expanded|alternate)\b[^()]*\)",
     ]
 
     MIN_TRACK_DURATION_MS = 60_000  # tracks shorter than this are filtered out by default
