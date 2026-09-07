@@ -2154,7 +2154,21 @@ class SongRadio:
             remaining_genres = remaining_genres[self.genres_to_use :]
             tried_genres.update(batch)
             print(f"Expanding candidate search (round {expansion_round}): {batch}")
-            fetch_round_robin({f'genre:"{g}"': None for g in batch}, self.max_results_per_genre)
+            # A genre that isn't truly exhausted (Spotify has more results
+            # somewhere) can still be fully cache-saturated *at
+            # max_results_per_genre* from a previous run - _paginated_search
+            # returns straight from cache once len(collected) >= max_results,
+            # with no live request at all, regardless of how many different
+            # genre strings get tried. Progressively raising the cap here
+            # pushes an already-explored-to-the-base-cap genre into
+            # genuinely new offsets instead of guaranteeing another
+            # zero-fresh-yield round - this is what actually breaks a
+            # min_fresh_fraction stall on a seed whose reachable genre
+            # space has already been searched before (repeated/similar
+            # queries), rather than just cycling through more not-yet-tried
+            # genre *names* that hit the same saturated cap.
+            expansion_cap = self.max_results_per_genre * (1 + expansion_round)
+            fetch_round_robin({f'genre:"{g}"': None for g in batch}, expansion_cap)
 
         pool = current_pool()
         final_fresh_fraction = fresh_fraction(pool)
