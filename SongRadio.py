@@ -2139,6 +2139,32 @@ class SongRadio:
                 or fresh_fraction(current_pool()) < self.min_fresh_fraction
             )
         ):
+            expansion_round += 1
+            # Same cache-saturation issue as genre search (see below)
+            # applies to the seed-artist and similar-artist catalog
+            # searches (sources 2/3 above) - they only ever ran once at a
+            # fixed cap, so once cache-saturated from a previous run
+            # (_paginated_search returns straight from cache whenever
+            # len(collected) >= max_results, with no live request at all)
+            # they'd stay stuck at zero fresh yield forever, no matter how
+            # many expansion rounds ran - and with typically far fewer
+            # seed/similar artists than genre strings to rotate through,
+            # this is often the *more* likely culprit for a persistent
+            # min_fresh_fraction stall than genre search. Boosted every
+            # round, independent of genre-name availability below, since
+            # an artist's catalog can keep yielding fresh tracks via a
+            # higher cap long after the genre-neighborhood well runs dry.
+            expansion_multiplier = 1 + expansion_round
+            fetch_round_robin(
+                {f'artist:"{a}"': a for a in self.seed_artist_names},
+                self.max_results_per_seed_artist * expansion_multiplier,
+            )
+            if self._similar_artist_pool_names:
+                fetch_round_robin(
+                    {f'artist:"{a}"': a for a in self._similar_artist_pool_names},
+                    self.max_results_per_similar_artist * expansion_multiplier,
+                )
+
             if not remaining_genres:
                 update_discovered_genres()
                 remaining_genres = [
@@ -2147,9 +2173,15 @@ class SongRadio:
                     and not genre_query_exhausted(g)
                 ]
                 if not remaining_genres:
-                    break  # genuinely nothing related left to try
+                    # No new genre *names* left to try this run - but the
+                    # artist-catalog boost above doesn't depend on that,
+                    # so keep looping (subject to the same round/target
+                    # budget) rather than giving up entirely. A later
+                    # round may also find new remaining_genres anyway, if
+                    # the artist-catalog boost just added new artists
+                    # whose tags update_discovered_genres hasn't seen yet.
+                    continue
 
-            expansion_round += 1
             batch = remaining_genres[: self.genres_to_use]
             remaining_genres = remaining_genres[self.genres_to_use :]
             tried_genres.update(batch)
@@ -2167,7 +2199,7 @@ class SongRadio:
             # space has already been searched before (repeated/similar
             # queries), rather than just cycling through more not-yet-tried
             # genre *names* that hit the same saturated cap.
-            expansion_cap = self.max_results_per_genre * (1 + expansion_round)
+            expansion_cap = self.max_results_per_genre * expansion_multiplier
             fetch_round_robin({f'genre:"{g}"': None for g in batch}, expansion_cap)
 
         pool = current_pool()
