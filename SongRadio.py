@@ -1659,8 +1659,18 @@ class SongRadio:
         db.execute(
             "CREATE TABLE IF NOT EXISTS queries ("
             "query TEXT PRIMARY KEY, offsets_fetched TEXT NOT NULL DEFAULT '[]', "
-            "exhausted INTEGER NOT NULL DEFAULT 0, last_fetched_at REAL)"
+            "exhausted INTEGER NOT NULL DEFAULT 0, last_fetched_at REAL, "
+            "capped_at_max_offset INTEGER NOT NULL DEFAULT 0)"
         )
+        # Migration for databases created before capped_at_max_offset
+        # existed (see _paginated_search: a query that hits _max_offset
+        # without Spotify ever returning an empty page was previously
+        # indistinguishable from a genuinely productive, not-yet-exhausted
+        # query - this column lets _is_query_exhausted recognize it as a
+        # dead end too, distinct from true exhaustion).
+        existing_query_cols = {row[1] for row in db.execute("PRAGMA table_info(queries)").fetchall()}
+        if "capped_at_max_offset" not in existing_query_cols:
+            db.execute("ALTER TABLE queries ADD COLUMN capped_at_max_offset INTEGER NOT NULL DEFAULT 0")
         db.execute(
             "CREATE TABLE IF NOT EXISTS query_tracks ("
             "query TEXT NOT NULL, track_id TEXT NOT NULL, PRIMARY KEY (query, track_id))"
@@ -1704,19 +1714,28 @@ class SongRadio:
 
         Returns:
             dict with "offsets_fetched" (list[int]), "exhausted" (bool),
-            "last_fetched_at" (float or None). A fresh/default state is
+            "last_fetched_at" (float or None), "capped_at_max_offset"
+            (bool - True if a previous call had to stop at _max_offset
+            without Spotify ever returning an empty page, i.e. a dead end
+            distinct from true exhaustion but just as unproductive to
+            retry - see _paginated_search). A fresh/default state is
             returned if the query has never been cached.
         """
         row = self._search_db.execute(
-            "SELECT offsets_fetched, exhausted, last_fetched_at FROM queries WHERE query = ?", (query,)
+            "SELECT offsets_fetched, exhausted, last_fetched_at, capped_at_max_offset FROM queries WHERE query = ?",
+            (query,),
         ).fetchone()
         if row is None:
-            return {"offsets_fetched": [], "exhausted": False, "last_fetched_at": None}
-        offsets_fetched, exhausted, last_fetched_at = row
+            return {
+                "offsets_fetched": [], "exhausted": False, "last_fetched_at": None,
+                "capped_at_max_offset": False,
+            }
+        offsets_fetched, exhausted, last_fetched_at, capped_at_max_offset = row
         return {
             "offsets_fetched": json.loads(offsets_fetched),
             "exhausted": bool(exhausted),
             "last_fetched_at": last_fetched_at,
+            "capped_at_max_offset": bool(capped_at_max_offset),
         }
 
     def _save_query_state(self, query, state):
@@ -1734,11 +1753,15 @@ class SongRadio:
             None.
         """
         self._search_db.execute(
-            "INSERT INTO queries (query, offsets_fetched, exhausted, last_fetched_at) VALUES (?, ?, ?, ?) "
+            "INSERT INTO queries (query, offsets_fetched, exhausted, last_fetched_at, capped_at_max_offset) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(query) DO UPDATE SET "
             "offsets_fetched=excluded.offsets_fetched, exhausted=excluded.exhausted, "
-            "last_fetched_at=excluded.last_fetched_at",
-            (query, json.dumps(state["offsets_fetched"]), int(state["exhausted"]), state["last_fetched_at"]),
+            "last_fetched_at=excluded.last_fetched_at, capped_at_max_offset=excluded.capped_at_max_offset",
+            (
+                query, json.dumps(state["offsets_fetched"]), int(state["exhausted"]), state["last_fetched_at"],
+                int(state["capped_at_max_offset"]),
+            ),
         )
         self._search_db.commit()
 
@@ -1775,7 +1798,18 @@ class SongRadio:
         )
 
     def _is_query_exhausted(self, query):
-        """Checks whether a query is already known to have no more results.
+        """Checks whether a query is already known to be a dead end.
+
+        True for two distinct but practically equivalent reasons: Spotify
+        confirmed there are genuinely no more results at any offset
+        (exhausted), or a previous call had to stop at _max_offset without
+        Spotify ever returning an empty page (capped_at_max_offset) -
+        Spotify may still have more results beyond that point, but this
+        codebase's own safety ceiling means _paginated_search can never
+        reach them regardless of how high max_results is set. Either way,
+        callers choosing which genre/artist to try next (see
+        genre_query_exhausted in build_candidate_pool) should treat this
+        query as unproductive to re-select.
 
         Args:
             query: Spotify search query string.
@@ -1783,8 +1817,10 @@ class SongRadio:
         Returns:
             bool.
         """
-        row = self._search_db.execute("SELECT exhausted FROM queries WHERE query = ?", (query,)).fetchone()
-        return bool(row and row[0])
+        row = self._search_db.execute(
+            "SELECT exhausted, capped_at_max_offset FROM queries WHERE query = ?", (query,)
+        ).fetchone()
+        return bool(row and (row[0] or row[1]))
 
     def _paginated_search(self, query, max_results, fresh_ids=None):
         """Pages through Spotify search results via offset.
@@ -1840,6 +1876,7 @@ class SongRadio:
             if age_days > self.cache_ttl_days:
                 state["offsets_fetched"] = []
                 state["exhausted"] = False
+                state["capped_at_max_offset"] = False
 
         collected = self._get_cached_tracks_for_query(query)
 
@@ -1923,6 +1960,20 @@ class SongRadio:
             # this query's updated state, atomically, in one transaction.
             self._save_query_state(query, state)
             offset += self.search_limit
+        # The loop can exit two ways without ever setting state["exhausted"]:
+        # its condition was false from the start (offset already past
+        # _max_offset from a previous call), or it ran and then walked
+        # offset past _max_offset without Spotify ever returning an empty
+        # page. Either way, this query is now a dead end for
+        # _paginated_search - no future max_results, however large, can
+        # ever produce another live fetch for it, since the loop condition
+        # itself blocks entry. Recording that distinctly (rather than
+        # leaving it indistinguishable from a genuinely still-productive
+        # query) is what lets _is_query_exhausted correctly deprioritize
+        # it instead of genre/artist selection wastefully re-picking it.
+        if not state["exhausted"] and offset > self._max_offset:
+            state["capped_at_max_offset"] = True
+            self._save_query_state(query, state)
         return collected
 
     def build_candidate_pool(self, genre_counter):
