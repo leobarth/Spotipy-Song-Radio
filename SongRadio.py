@@ -50,6 +50,8 @@ import spotipy
 from langdetect import LangDetectException, detect
 from spotipy.oauth2 import SpotifyOAuth
 
+from StreamingHistory import StreamingHistoryStats
+
 logger = logging.getLogger("song_radio.lastfm")
 
 
@@ -1458,6 +1460,82 @@ class SongRadio:
             t = re.sub(pattern, "", t, flags=re.IGNORECASE)
         return re.sub(r"[^a-z0-9]+", " ", t).strip()
 
+    # --- Streaming history (optional, explicitly invoked) ----------------
+
+    def load_streaming_history(self, stats):
+        """Persists processed Spotify Extended Streaming History stats
+        into the local SQLite cache, so they survive across runs without
+        being reprocessed every time.
+
+        Call this once whenever a *new* history export has been parsed
+        with StreamingHistory.StreamingHistoryParser - not on every
+        SongRadio run. A call always fully replaces whatever streaming-
+        history stats were stored before: a fresh export is always a
+        complete, cumulative history rather than a delta, so there is
+        nothing to merge - the previous snapshot is simply stale once a
+        newer one exists.
+
+        Note: this method only stores the data. It does not currently
+        change candidate gathering or scoring in any way - that's a
+        deliberate next step, not yet built (the planned use is a
+        familiarity-based scoring adjustment, analogous to
+        popularity_bias, that would read these tables).
+
+        Args:
+            stats: A StreamingHistory.StreamingHistoryStats instance, as
+                returned by StreamingHistory.StreamingHistoryParser.parse().
+
+        Returns:
+            None.
+        """
+        now = time.time()
+
+        self._search_db.execute("DELETE FROM streaming_history_artists")
+        self._search_db.execute("DELETE FROM streaming_history_tracks")
+        self._search_db.execute("DELETE FROM streaming_history_podcasts")
+        self._search_db.execute("DELETE FROM streaming_history_audiobooks")
+
+        for artist_name, entity in stats.artists.items():
+            self._search_db.execute(
+                "INSERT INTO streaming_history_artists "
+                "(artist_name, play_count, skip_count, total_ms_played, weighted_score, "
+                "last_played_ts, loaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (artist_name, entity.play_count, entity.skip_count, entity.total_ms_played,
+                 entity.weighted_score, entity.last_played_ts, now),
+            )
+        for (artist_name, track_name), entity in stats.tracks.items():
+            self._search_db.execute(
+                "INSERT INTO streaming_history_tracks "
+                "(artist_name, track_name, play_count, skip_count, total_ms_played, "
+                "weighted_score, last_played_ts, loaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (artist_name, track_name, entity.play_count, entity.skip_count,
+                 entity.total_ms_played, entity.weighted_score, entity.last_played_ts, now),
+            )
+        for show_name, entity in stats.podcast_shows.items():
+            self._search_db.execute(
+                "INSERT INTO streaming_history_podcasts "
+                "(show_name, play_count, skip_count, total_ms_played, weighted_score, "
+                "last_played_ts, loaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (show_name, entity.play_count, entity.skip_count, entity.total_ms_played,
+                 entity.weighted_score, entity.last_played_ts, now),
+            )
+        for title, entity in stats.audiobooks.items():
+            self._search_db.execute(
+                "INSERT INTO streaming_history_audiobooks "
+                "(title, play_count, skip_count, total_ms_played, weighted_score, "
+                "last_played_ts, loaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (title, entity.play_count, entity.skip_count, entity.total_ms_played,
+                 entity.weighted_score, entity.last_played_ts, now),
+            )
+        self._search_db.commit()
+
+        logger.info(
+            "Loaded streaming history: %d artist(s), %d track(s), %d podcast show(s), "
+            "%d audiobook(s) (%d record(s) processed, half-life %.0f day(s)).",
+            len(stats.artists), len(stats.tracks), len(stats.podcast_shows), len(stats.audiobooks),
+            stats.total_records_processed, stats.half_life_days,
+        )
+
     # --- Pipeline steps ----------------------------------------------
 
     def resolve_seed_track_ids(self):
@@ -1702,6 +1780,40 @@ class SongRadio:
             "artist_name TEXT NOT NULL, track_name TEXT NOT NULL, "
             "listeners INTEGER, fetched_at REAL, "
             "PRIMARY KEY (artist_name, track_name))"
+        )
+        # Persisted output of StreamingHistory.StreamingHistoryParser (see
+        # load_streaming_history) - a user's own Spotify listening
+        # history, parsed once and reused across runs rather than
+        # reprocessed every time. Written to from the main thread only
+        # (load_streaming_history is an explicit, occasional call, not
+        # something invoked from the Last.fm executor's worker threads),
+        # so this connection is fine for it, same as the query-cache
+        # tables above.
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS streaming_history_artists ("
+            "artist_name TEXT PRIMARY KEY, play_count INTEGER NOT NULL, "
+            "skip_count INTEGER NOT NULL, total_ms_played INTEGER NOT NULL, "
+            "weighted_score REAL NOT NULL, last_played_ts TEXT, loaded_at REAL NOT NULL)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS streaming_history_tracks ("
+            "artist_name TEXT NOT NULL, track_name TEXT NOT NULL, "
+            "play_count INTEGER NOT NULL, skip_count INTEGER NOT NULL, "
+            "total_ms_played INTEGER NOT NULL, weighted_score REAL NOT NULL, "
+            "last_played_ts TEXT, loaded_at REAL NOT NULL, "
+            "PRIMARY KEY (artist_name, track_name))"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS streaming_history_podcasts ("
+            "show_name TEXT PRIMARY KEY, play_count INTEGER NOT NULL, "
+            "skip_count INTEGER NOT NULL, total_ms_played INTEGER NOT NULL, "
+            "weighted_score REAL NOT NULL, last_played_ts TEXT, loaded_at REAL NOT NULL)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS streaming_history_audiobooks ("
+            "title TEXT PRIMARY KEY, play_count INTEGER NOT NULL, "
+            "skip_count INTEGER NOT NULL, total_ms_played INTEGER NOT NULL, "
+            "weighted_score REAL NOT NULL, last_played_ts TEXT, loaded_at REAL NOT NULL)"
         )
         db.commit()
         return db
