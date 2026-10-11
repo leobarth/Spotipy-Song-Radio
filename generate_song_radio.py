@@ -1,45 +1,52 @@
+"""
+generate_song_radio.py
+======================
+
+Entry point for the standard SongRadio pipeline (seed track → candidate
+pool → filter/rank → optional playlist creation). Functionally equivalent
+to the original main.py - flags and config-loading logic are unchanged.
+
+To load a Spotify Extended Streaming History export into the local cache,
+run load_streaming_history.py separately (once per new export, not on
+every SongRadio run).
+"""
+
 import argparse
 import json
 import logging
 import os
 
 
-def load_config():
-    """Loads config.json, falling back to config_template.json if absent.
+def load_config(name="config"):
+    """Loads <name>.json, falling back to <name>_template.json if absent.
 
     Args:
-        None.
+        name: Config file stem (without extension).
 
     Returns:
         dict: the parsed configuration.
 
     Raises:
-        RuntimeError: if neither file exists, or if the file that does exist
-            contains invalid JSON.
+        RuntimeError: if neither file exists, or if the file that does
+            exist contains invalid JSON.
     """
-    try:
-        with open("config.json", "r") as file:
-            return json.load(file)
-    except FileNotFoundError:
-        pass
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"config.json exists but is not valid JSON: {e}")
-
-    try:
-        with open("config_template.json", "r") as file:
-            return json.load(file)
-    except FileNotFoundError:
-        raise RuntimeError(
-            "Could not find 'config.json' or 'config_template.json' in this directory."
-        )
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"config_template.json exists but is not valid JSON: {e}")
+    for filename in (f"{name}.json", f"{name}_template.json"):
+        try:
+            with open(filename, "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            continue
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"{filename} exists but is not valid JSON: {e}")
+    raise RuntimeError(
+        f"Could not find '{name}.json' or '{name}_template.json' in this directory."
+    )
 
 
 def main():
     from SongRadio import SongRadio
 
-    config = load_config()
+    config = load_config("config")
     radio = SongRadio(**config)
 
     try:
@@ -149,7 +156,8 @@ def run_with_yappi():
         func_stats = yappi.get_func_stats()
         func_stats.sort("ttot", "desc")
 
-        project_stats = [s for s in func_stats if os.path.basename(s.module) in {"main.py", "SongRadio.py"}]
+        project_files = {"generate_song_radio.py", "SongRadio.py", "StreamingHistory.py"}
+        project_stats = [s for s in func_stats if os.path.basename(s.module) in project_files]
         _print_func_stats(project_stats, limit=25, label="Project code")
         _print_func_stats(list(func_stats), limit=15, label="All code")
 

@@ -615,6 +615,7 @@ class SongRadio:
                 client_secret=client_secret,
                 redirect_uri=redirect_uri,
                 scope="user-library-read playlist-read-private playlist-modify-private playlist-modify-public",
+                show_dialog=True,
             ),
             retries=0,  # otherwise spotipy would sleep the full Retry-After itself (possibly hours)
             requests_timeout=10,
@@ -1494,6 +1495,7 @@ class SongRadio:
         self._search_db.execute("DELETE FROM streaming_history_tracks")
         self._search_db.execute("DELETE FROM streaming_history_podcasts")
         self._search_db.execute("DELETE FROM streaming_history_audiobooks")
+        self._search_db.execute("DELETE FROM streaming_history_artist_buckets")
 
         for artist_name, entity in stats.artists.items():
             self._search_db.execute(
@@ -1527,12 +1529,39 @@ class SongRadio:
                 (title, entity.play_count, entity.skip_count, entity.total_ms_played,
                  entity.weighted_score, entity.last_played_ts, now),
             )
+        # Persist artist time-buckets for Daylist seed selection.
+        # For each artist/slot/weekday triple we store the slot-aggregated
+        # score and the weekday-aggregated score separately, so Daylist can
+        # weight them independently rather than being forced to use only
+        # the joint (slot, weekday) value.
+        for artist_name, buckets in (stats.artist_time_buckets or {}).items():
+            written_pairs = set()
+            for (slot_label, weekday_label), joint_score in buckets.by_slot_weekday.items():
+                if joint_score <= 0:
+                    continue
+                pair = (slot_label, weekday_label)
+                if pair in written_pairs:
+                    continue
+                written_pairs.add(pair)
+                slot_score = buckets.by_slot.get(slot_label, 0.0)
+                weekday_score = buckets.by_weekday.get(weekday_label, 0.0)
+                self._search_db.execute(
+                    "INSERT INTO streaming_history_artist_buckets "
+                    "(artist_name, slot_label, weekday_label, slot_score, weekday_score, loaded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(artist_name, slot_label, weekday_label) DO UPDATE SET "
+                    "slot_score=excluded.slot_score, weekday_score=excluded.weekday_score, "
+                    "loaded_at=excluded.loaded_at",
+                    (artist_name, slot_label, weekday_label, slot_score, weekday_score, now),
+                )
+
         self._search_db.commit()
 
         logger.info(
             "Loaded streaming history: %d artist(s), %d track(s), %d podcast show(s), "
-            "%d audiobook(s) (%d record(s) processed, half-life %.0f day(s)).",
+            "%d audiobook(s), %d artist-bucket row(s) (%d record(s) processed, half-life %.0f day(s)).",
             len(stats.artists), len(stats.tracks), len(stats.podcast_shows), len(stats.audiobooks),
+            len(stats.artist_time_buckets or {}),
             stats.total_records_processed, stats.half_life_days,
         )
 
@@ -1814,6 +1843,20 @@ class SongRadio:
             "title TEXT PRIMARY KEY, play_count INTEGER NOT NULL, "
             "skip_count INTEGER NOT NULL, total_ms_played INTEGER NOT NULL, "
             "weighted_score REAL NOT NULL, last_played_ts TEXT, loaded_at REAL NOT NULL)"
+        )
+        # Per-artist time-bucket scores for Daylist seed selection.
+        # One row per (artist_name, slot_label, weekday_label) triple -
+        # stores the aggregated slot_score and weekday_score from
+        # StreamingHistoryStats.artist_time_buckets so Daylist can ask
+        # "what artists do I play on Friday evenings?" without re-scanning
+        # every individual track. Only populated when load_streaming_history
+        # is called with a StreamingHistoryStats that has artist_time_buckets
+        # populated (i.e. parsed with StreamingHistoryParser).
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS streaming_history_artist_buckets ("
+            "artist_name TEXT NOT NULL, slot_label TEXT NOT NULL, weekday_label TEXT NOT NULL, "
+            "slot_score REAL NOT NULL, weekday_score REAL NOT NULL, loaded_at REAL NOT NULL, "
+            "PRIMARY KEY (artist_name, slot_label, weekday_label))"
         )
         db.commit()
         return db
@@ -2736,3 +2779,132 @@ class SongRadio:
         add_resp.raise_for_status()
 
         print(f"Playlist '{name}' created: {playlist['external_urls']['spotify']}")
+
+    def playlist_exists(self, playlist_id):
+        """Checks whether a Spotify playlist ID still exists and is accessible.
+
+        Uses GET /playlists/{id} with fields=id to minimise response size.
+        A 404 (deleted/unfollowed playlist) returns False; any other HTTP
+        error is re-raised so genuine auth/network problems aren't silently
+        swallowed.
+
+        Args:
+            playlist_id: Spotify playlist ID string.
+
+        Returns:
+            bool.
+        """
+        resp = requests.get(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}",
+            headers=self._bearer_headers(),
+            params={"fields": "id"},
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+        return True
+
+    def create_empty_playlist(self, name, description=None):
+        """Creates a new empty private playlist and returns its ID.
+
+        Args:
+            name: Playlist name (str).
+            description: Optional description (str, max 300 chars).
+
+        Returns:
+            Spotify playlist ID (str).
+
+        Raises:
+            requests.exceptions.HTTPError: If creation fails.
+        """
+        body = {"name": name, "public": False}
+        if description:
+            body["description"] = description[:300]
+        resp = requests.post(
+            "https://api.spotify.com/v1/me/playlists",
+            headers=self._bearer_headers(),
+            json=body,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    def update_playlist(self, playlist_id, description=None):
+        """Replaces a playlist's tracks (and optionally description) in place.
+
+        Unlike save_as_playlist, this never creates a new playlist - it
+        updates an existing one identified by playlist_id. The intended
+        use case is the Daylist (see Daylist.py), which maintains a single
+        persistent playlist that gets refreshed on each run rather than
+        accumulating new playlists over time.
+
+        Uses PUT /playlists/{id}/tracks, which replaces the entire
+        tracklist atomically in one request, followed by a PATCH on the
+        playlist details if a description is supplied.
+
+        Args:
+            playlist_id: Spotify playlist ID string (the 22-character
+                base-62 identifier, not the full URI or URL).
+            description: Optional playlist description string. Passed
+                through to Spotify as-is - callers are responsible for
+                keeping it under Spotify's 300-character limit. If None,
+                the playlist description is left unchanged.
+
+        Returns:
+            None.
+
+        Raises:
+            requests.exceptions.HTTPError: If the track-replace or
+                description-update request fails.
+        """
+        if not self.picks:
+            print("No tracks available to save.")
+            return
+
+        uris = []
+        if self.include_seed_tracks:
+            uris.extend(t["uri"] for t in self.seed_tracks)
+        uris.extend(pick["track"]["uri"] for pick in self.picks)
+
+        replace_resp = requests.put(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
+            headers=self._bearer_headers(),
+            json={"uris": uris},
+            timeout=10,
+        )
+        replace_resp.raise_for_status()
+
+        if description is not None:
+            details_resp = requests.put(
+                f"https://api.spotify.com/v1/playlists/{playlist_id}",
+                headers=self._bearer_headers(),
+                json={"description": description[:300]},
+                timeout=10,
+            )
+            details_resp.raise_for_status()
+
+        print(f"Playlist {playlist_id} updated: https://open.spotify.com/playlist/{playlist_id}")
+
+    def get_familiarity_scores(self):
+        """Reads per-artist familiarity scores from the persisted streaming
+        history cache (loaded via load_streaming_history) as a plain dict.
+
+        This is deliberately a thin read-only accessor rather than being
+        wired directly into scoring - familiarity-based scoring is not yet
+        built into filter_and_rank. The Daylist (see Daylist.py) uses this
+        to apply its own familiarity weighting on top of the standard
+        SongRadio scoring, keeping the two concerns separated.
+
+        Args:
+            None.
+
+        Returns:
+            dict mapping lowercased artist_name -> weighted_score (float),
+            for every artist present in streaming_history_artists. Empty
+            dict if no streaming history has been loaded yet.
+        """
+        rows = self._search_db.execute(
+            "SELECT artist_name, weighted_score FROM streaming_history_artists"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
