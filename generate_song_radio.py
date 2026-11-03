@@ -1,80 +1,57 @@
-"""
-generate_song_radio.py
-======================
-
-Entry point for the standard SongRadio pipeline (seed track → candidate
-pool → filter/rank → optional playlist creation). Functionally equivalent
-to the original main.py - flags and config-loading logic are unchanged.
-
-To load a Spotify Extended Streaming History export into the local cache,
-run load_streaming_history.py separately (once per new export, not on
-every SongRadio run).
-"""
+"""CLI entry point for generating SongRadio recommendations."""
 
 import argparse
-import json
 import logging
 import os
 
+from config_utils import keyword_parameters, load_config as _load_config
+
+logger = logging.getLogger("song_radio.cli")
+
 
 def load_config(name="config"):
-    """Loads <name>.json, falling back to <name>_template.json if absent.
+    """Load and validate the SongRadio configuration."""
+    from SongRadio import SongRadio
 
-    Args:
-        name: Config file stem (without extension).
-
-    Returns:
-        dict: the parsed configuration.
-
-    Raises:
-        RuntimeError: if neither file exists, or if the file that does
-            exist contains invalid JSON.
-    """
-    for filename in (f"{name}.json", f"{name}_template.json"):
-        try:
-            with open(filename, "r") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            continue
-        except json.JSONDecodeError as e:
-            raise RuntimeError(f"{filename} exists but is not valid JSON: {e}")
-    raise RuntimeError(
-        f"Could not find '{name}.json' or '{name}_template.json' in this directory."
+    return _load_config(
+        name,
+        allowed_keys=keyword_parameters(SongRadio) | {"timezone_name"},
+        required_keys={
+            "client_id",
+            "client_secret",
+            "redirect_uri",
+            "lastfm_api_key",
+            "seed_queries",
+        },
     )
 
 
 def main():
+    """Run SongRadio and optionally save its recommendations as a playlist."""
     from SongRadio import SongRadio
 
-    config = load_config("config")
-    radio = SongRadio(**config)
+    config = load_config()
+    seed_queries = config.get("seed_queries")
+    if not isinstance(seed_queries, dict) or not seed_queries:
+        raise RuntimeError("config.json must define at least one seed artist and track.")
 
+    radio_config = {key: value for key, value in config.items() if key != "timezone_name"}
+    radio = SongRadio(**radio_config)
     try:
-        print("Resolving seed tracks...")
-        seed_track_ids = radio.resolve_seed_track_ids()
-        if not seed_track_ids:
-            raise RuntimeError("No seed tracks found - aborting.")
-
-        print("\nLoading artist data and genres...")
-        seed_artist_ids, genre_counter = radio.get_seed_artist_ids_and_genres(seed_track_ids)
+        result = radio.run_pipeline()
 
         print("\n--- Detected Genres ---")
-        for genre, count in genre_counter.most_common(10):
-            print(f"  {genre}  (x{count})")
+        for genre, count in result["genres"].most_common(10):
+            print(f"  {genre} (x{count})")
 
-        print("\nBuilding candidate pool...")
-        candidates = radio.build_candidate_pool(genre_counter)
-        print(f"{len(candidates)} candidates found.\n")
-
-        print("Selecting tracks...")
-        radio.filter_and_rank(candidates)
+        print(f"\n{len(result['candidates'])} candidates found.")
         radio.print_results()
+        print("\n" + result["lastfm_health"])
 
-        print("\n" + radio.lastfm_health_summary())
-
-        answer = input("\nSave as a playlist in your library? [Y/n] ").strip().lower()
+        answer = input("\nSave as a playlist in your library? [Y/n] ").strip().casefold()
         if answer in ("", "y", "yes"):
-            radio.save_as_playlist()
+            playlist_id = radio.save_as_playlist()
+            print(f"Playlist saved: https://open.spotify.com/playlist/{playlist_id}")
         else:
             print("Playlist will not be saved.")
     finally:
@@ -82,15 +59,7 @@ def main():
 
 
 def run_with_cprofile():
-    """Runs main() under cProfile.
-
-    Note: cProfile only instruments the thread it's enabled on. Calls made
-    inside SongRadio's ThreadPoolExecutor workers (the concurrent Last.fm
-    lookups in filter_and_rank) will NOT be attributed here - this profile
-    is only reliable for everything that still runs single-threaded
-    (Spotify search/pagination, language detection, dedup, etc). Use
-    run_with_yappi() for a profile that includes the worker threads.
-    """
+    """Run main under cProfile and print the most expensive functions."""
     import cProfile
     import pstats
 
@@ -106,44 +75,17 @@ def run_with_cprofile():
 
 
 def _print_func_stats(stats, limit, label):
-    """Prints a short, fixed-width table for a yappi func-stats iterable.
-
-    yappi's own stats.print_all() dumps every profiled function - typically
-    thousands of stdlib/library entries - which is unreadable in a terminal.
-    This prints at most `limit` rows instead.
-
-    Args:
-        stats: Iterable of yappi YFuncStat entries, already sorted.
-        limit: Maximum number of rows to print.
-        label: Section heading.
-
-    Returns:
-        None.
-    """
+    """Print a bounded summary of yappi function statistics."""
     print(f"\n--- {label} (top {limit}) ---")
     print(f"{'ncall':>8}  {'ttot(s)':>9}  {'tsub(s)':>9}  name")
-    shown = 0
-    for stat in stats:
-        if shown >= limit:
+    for index, stat in enumerate(stats):
+        if index >= limit:
             break
         print(f"{stat.ncall:>8}  {stat.ttot:>9.3f}  {stat.tsub:>9.3f}  {stat.full_name}")
-        shown += 1
 
 
 def run_with_yappi():
-    """Runs main() under yappi, which (unlike cProfile) tracks time across threads.
-
-    Requires `pip install yappi`. Reports wall-clock time so that time spent
-    blocked on network I/O in worker threads is visible. Output is
-    deliberately trimmed to three short sections instead of yappi's default
-    full dump (which lists every stdlib/library function and floods the
-    terminal):
-      1. Project code only (this file + SongRadio.py), sorted by total time.
-      2. Top 15 functions overall (including libraries), for context.
-      3. A one-row-per-thread summary, showing how much wall time each
-         worker thread actually spent - the most direct evidence of whether
-         concurrency is being used effectively.
-    """
+    """Run main under yappi, including time spent in worker threads."""
     import yappi
 
     yappi.set_clock_type("wall")
@@ -152,34 +94,29 @@ def run_with_yappi():
         main()
     finally:
         yappi.stop()
-
-        func_stats = yappi.get_func_stats()
-        func_stats.sort("ttot", "desc")
+        function_stats = yappi.get_func_stats()
+        function_stats.sort("ttot", "desc")
 
         project_files = {"generate_song_radio.py", "SongRadio.py", "StreamingHistory.py"}
-        project_stats = [s for s in func_stats if os.path.basename(s.module) in project_files]
-        _print_func_stats(project_stats, limit=25, label="Project code")
-        _print_func_stats(list(func_stats), limit=15, label="All code")
+        project_stats = [
+            stat for stat in function_stats
+            if stat.module and os.path.basename(stat.module) in project_files
+        ]
+        _print_func_stats(project_stats, 25, "Project code")
+        _print_func_stats(list(function_stats), 15, "All code")
 
         print("\n--- Per-thread summary ---")
         thread_stats = yappi.get_thread_stats()
         thread_stats.sort("ttot", "desc")
         thread_stats.print_all()
-
         yappi.clear_stats()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Song Radio (Low-Mainstream Edition)")
-    parser.add_argument("--profile", action="store_true", help="Profile with cProfile (main thread only).")
-    parser.add_argument(
-        "--profile-threads", action="store_true",
-        help="Profile with yappi, including worker-thread time (requires `pip install yappi`).",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true",
-        help="Show INFO-level logs (Last.fm request counts), not just warnings/alerts.",
-    )
+    parser = argparse.ArgumentParser(description="Generate SongRadio recommendations.")
+    parser.add_argument("--profile", action="store_true", help="Profile with cProfile.")
+    parser.add_argument("--profile-threads", action="store_true", help="Profile with yappi, including worker threads.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable INFO-level logging.")
     args = parser.parse_args()
 
     logging.basicConfig(

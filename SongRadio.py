@@ -1,78 +1,32 @@
-"""
-Song Radio (Low-Mainstream Edition)
+"""Spotify and Last.fm recommendation pipeline with persistent SQLite caches."""
 
-Spotify's Development Mode API was heavily restricted in Feb 2026 (batch
-endpoints, "popularity", and the old playlist endpoints were removed).
-https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide
-
-Playlist creation/population therefore uses raw requests
-(POST /me/playlists, POST /playlists/{id}/items), since spotipy still uses
-the removed endpoints internally (/users/{id}/playlists, /playlists/{id}/tracks).
-
-Last.fm API calls
-------------------
-Last.fm has no documented hard rate limit (unlike Spotify), so this module
-treats it defensively rather than optimistically:
-  - every request goes through exponential backoff with jitter, and a 429
-    is treated as an early warning rather than a hard failure: it's retried
-    (respecting Retry-After if present) instead of aborting outright.
-  - a rolling-window monitor (LastFmRequestMonitor) tracks error/429 rates
-    per API key and logs alerts when they rise, independent of whether any
-    individual request ultimately succeeds.
-  - concurrent fetching (ThreadPoolExecutor) is used to shorten wall-clock
-    time, but concurrency is adaptive: it backs off when the monitor sees
-    elevated 429s and only cautiously ramps back up after a run of clean
-    batches.
-  - Last.fm has no multi-artist "batch" endpoint, so "batching" here means
-    firing several single-artist requests concurrently, not a single
-    multi-entity request. Artist-level results (tags, listener counts, top
-    tracks) are cached for the lifetime of the instance so no artist is
-    ever queried twice.
-"""
-
+import difflib
+import enum
+import json
 import logging
 import random
 import re
-import json
 import sqlite3
-import difflib
 import threading
 import time
-import enum
 from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from functools import lru_cache
 from typing import cast
 
 import requests
-from requests.adapters import HTTPAdapter
 import spotipy
 from langdetect import LangDetectException, detect
+from requests.adapters import HTTPAdapter
 from spotipy.oauth2 import SpotifyOAuth
 
+from normalization import normalize_artist_name, normalize_track_title
 from StreamingHistory import StreamingHistoryStats
 
-logger = logging.getLogger("song_radio.lastfm")
+logger = logging.getLogger("song_radio")
 
 
 class _CacheMiss(enum.Enum):
-    """Sentinel type for "not cached / never fetched / expired" in the
-    persisted Last.fm cache, distinct from a legitimately cached value of
-    None (e.g. an artist Last.fm genuinely has no listener count for) -
-    see SongRadio._load_persisted_artist_field /
-    _load_persisted_track_listeners.
-
-    A dedicated Enum rather than a plain object() sentinel: every Python
-    value is an instance of `object`, so `isinstance(x, object)` is always
-    True regardless of what `x` actually is - not a usable type guard, and
-    the reason a plain `object()` sentinel can trip IDE/type-checker
-    warnings (the checker can't narrow `x` away from bare `object` after
-    an `is not _CACHE_MISS` check, so it still looks like `object` -
-    which has no __getitem__ - even though at runtime it's a list/int/None
-    by that point). Enum members are singletons that type checkers like
-    Pyright specifically recognize for `is`/`is not` narrowing, so this
-    fixes the warning at its root instead of suppressing it.
-    """
     TOKEN = enum.auto()
 
 
@@ -80,56 +34,30 @@ _CACHE_MISS = _CacheMiss.TOKEN
 
 
 class LastFmRequestMonitor:
-    """Tracks Last.fm request outcomes and raises alerts on elevated error/429 rates.
-
-    Thread-safe. Keeps a rolling window of the most recent request outcomes
-    (per API key) rather than a lifetime average, so a recent spike in
-    errors or 429s is visible even if the instance has made thousands of
-    clean requests earlier in the run.
-    """
+    """Thread-safe rolling monitor for Last.fm request outcomes and latency."""
 
     def __init__(
-        self, api_key, window_size=40, error_rate_alert=0.3, throttle_rate_alert=0.15,
-        latency_alert_multiplier=2.0, baseline_sample_size=20,
+        self,
+        api_key,
+        window_size=40,
+        error_rate_alert=0.3,
+        throttle_rate_alert=0.15,
+        latency_alert_multiplier=2.0,
+        baseline_sample_size=20,
     ):
-        """Initializes the monitor.
-
-        Args:
-            api_key: The Last.fm API key being monitored (only its last 4
-                characters are ever logged, to avoid leaking the key).
-            window_size: Number of most recent outcomes considered when
-                computing rolling error/throttle rates and recent latency.
-            error_rate_alert: Rolling error rate (network errors, 5xx) at or
-                above which an alert is logged.
-            throttle_rate_alert: Rolling 429 rate at or above which an alert
-                is logged and the caller is expected to reduce concurrency.
-            latency_alert_multiplier: How many times slower than the
-                established baseline the recent median response latency
-                must become before an alert is logged. This is meant to
-                catch server-side slowdown under load even when it never
-                escalates to an outright 429 - Last.fm has no documented
-                rate limit, so quietly getting slower is a plausible first
-                symptom of approaching one.
-            baseline_sample_size: Number of early, presumably-uncontended
-                requests used to establish the "normal" latency baseline
-                against which later slowdowns are measured.
-
-        Returns:
-            None.
-        """
+        if window_size < 1 or baseline_sample_size < 1:
+            raise ValueError("Monitor window and baseline sample size must be positive")
         self.api_key = api_key
         self.window_size = window_size
         self.error_rate_alert = error_rate_alert
         self.throttle_rate_alert = throttle_rate_alert
         self.latency_alert_multiplier = latency_alert_multiplier
-        # Reentrant: summary() calls recent_median_latency while already
-        # holding the lock, which a plain Lock would deadlock on.
         self._lock = threading.RLock()
-        self._outcomes = deque(maxlen=window_size)  # "ok" | "error" | "throttled"
-        self._latencies = deque(maxlen=window_size)  # seconds, successful requests only
+        self._outcomes = deque(maxlen=window_size)
+        self._latencies = deque(maxlen=window_size)
         self._baseline_samples = []
         self._baseline_sample_size = baseline_sample_size
-        self.baseline_latency = None  # set once, from the first baseline_sample_size successes
+        self.baseline_latency = None
         self.total_requests = 0
         self.total_errors = 0
         self.total_throttled = 0
@@ -138,119 +66,83 @@ class LastFmRequestMonitor:
         self._alerted_latency = False
 
     def record(self, outcome, latency=None):
-        """Records a single request outcome and logs alerts if thresholds are crossed.
+        """Record one request outcome and emit alerts when thresholds are crossed."""
+        if outcome not in {"ok", "error", "throttled"}:
+            raise ValueError(f"Unknown Last.fm request outcome: {outcome}")
 
-        Args:
-            outcome: One of "ok", "error", "throttled".
-            latency: Response time in seconds, for successful ("ok")
-                requests only. Errors/timeouts are excluded from latency
-                tracking since their duration reflects the failure mode
-                (e.g. a 5s connect timeout) rather than genuine server
-                responsiveness, which would badly skew the baseline.
-
-        Returns:
-            None.
-        """
         with self._lock:
             self.total_requests += 1
-            if outcome == "error":
-                self.total_errors += 1
-            elif outcome == "throttled":
-                self.total_throttled += 1
+            self.total_errors += outcome == "error"
+            self.total_throttled += outcome == "throttled"
             self._outcomes.append(outcome)
 
-            if latency is not None and outcome == "ok":
+            if outcome == "ok" and latency is not None and latency >= 0:
                 if self.baseline_latency is None:
                     self._baseline_samples.append(latency)
                     if len(self._baseline_samples) >= self._baseline_sample_size:
                         ordered = sorted(self._baseline_samples)
-                        self.baseline_latency = ordered[len(ordered) // 2]  # median
+                        self.baseline_latency = ordered[len(ordered) // 2]
                         logger.info(
-                            "Last.fm key ...%s: baseline latency established at %.3fs.",
-                            self.api_key[-4:], self.baseline_latency,
+                            "Last.fm key ...%s: baseline latency %.3fs.",
+                            self.api_key[-4:],
+                            self.baseline_latency,
                         )
                 self._latencies.append(latency)
 
-            if self.total_requests % 25 == 0:
-                latency_note = (
-                    f", recent median latency {self.recent_median_latency:.3f}s"
-                    f" (baseline {self.baseline_latency:.3f}s)"
-                    if self.baseline_latency is not None else ""
-                )
-                logger.info(
-                    "Last.fm key ...%s: %d requests so far (%d errors, %d throttled)%s.",
-                    self.api_key[-4:], self.total_requests, self.total_errors, self.total_throttled,
-                    latency_note,
-                )
-
             if len(self._outcomes) >= self.window_size:
-                error_rate = sum(1 for o in self._outcomes if o == "error") / len(self._outcomes)
-                throttle_rate = sum(1 for o in self._outcomes if o == "throttled") / len(self._outcomes)
+                count = len(self._outcomes)
+                error_rate = sum(value == "error" for value in self._outcomes) / count
+                throttle_rate = sum(value == "throttled" for value in self._outcomes) / count
 
                 if error_rate >= self.error_rate_alert and not self._alerted_error:
                     logger.warning(
-                        "ALERT: Last.fm error rate %.0f%% over the last %d requests (key ...%s).",
-                        error_rate * 100, self.window_size, self.api_key[-4:],
+                        "Last.fm error rate %.0f%% over the last %d requests (key ...%s).",
+                        error_rate * 100,
+                        count,
+                        self.api_key[-4:],
                     )
                     self._alerted_error = True
                 elif error_rate < self.error_rate_alert * 0.5:
-                    self._alerted_error = False  # recovered; allow re-alerting if it climbs again
+                    self._alerted_error = False
 
                 if throttle_rate >= self.throttle_rate_alert and not self._alerted_throttle:
                     logger.warning(
-                        "ALERT: Last.fm 429 rate %.0f%% over the last %d requests (key ...%s) "
-                        "- concurrency should be reduced.",
-                        throttle_rate * 100, self.window_size, self.api_key[-4:],
+                        "Last.fm 429 rate %.0f%% over the last %d requests (key ...%s).",
+                        throttle_rate * 100,
+                        count,
+                        self.api_key[-4:],
                     )
                     self._alerted_throttle = True
                 elif throttle_rate < self.throttle_rate_alert * 0.5:
                     self._alerted_throttle = False
 
-            # Latency alert: a rolling window is used here too (rather than
-            # requiring it to be full of "ok" outcomes) so a real slowdown
-            # is caught even if the window is being diluted by unrelated
-            # errors/throttles that don't themselves carry a latency value.
-            if self.baseline_latency is not None and len(self._latencies) >= min(10, self.window_size):
+            minimum_latency_samples = min(10, self.window_size)
+            if self.baseline_latency and len(self._latencies) >= minimum_latency_samples:
                 ordered = sorted(self._latencies)
-                recent_median = ordered[len(ordered) // 2]
-                slowdown_threshold = self.baseline_latency * self.latency_alert_multiplier
-
-                if recent_median >= slowdown_threshold and not self._alerted_latency:
+                recent = ordered[len(ordered) // 2]
+                threshold = self.baseline_latency * self.latency_alert_multiplier
+                if recent >= threshold and not self._alerted_latency:
                     logger.warning(
-                        "ALERT: Last.fm response latency has risen to %.3fs (baseline %.3fs, key ...%s) "
-                        "- this can be a silent precursor to throttling even with no 429s seen.",
-                        recent_median, self.baseline_latency, self.api_key[-4:],
+                        "Last.fm latency rose to %.3fs (baseline %.3fs, key ...%s).",
+                        recent,
+                        self.baseline_latency,
+                        self.api_key[-4:],
                     )
                     self._alerted_latency = True
-                elif recent_median < slowdown_threshold * 0.7:
-                    self._alerted_latency = False  # recovered; allow re-alerting if it climbs again
+                elif recent < threshold * 0.7:
+                    self._alerted_latency = False
 
     @property
     def recent_throttle_rate(self):
-        """Current rolling 429 rate.
-
-        Args:
-            None.
-
-        Returns:
-            Float in [0, 1]. 0.0 if fewer than window_size requests have
-            been recorded yet.
-        """
+        """Return the throttle rate in the rolling window."""
         with self._lock:
             if not self._outcomes:
                 return 0.0
-            return sum(1 for o in self._outcomes if o == "throttled") / len(self._outcomes)
+            return sum(value == "throttled" for value in self._outcomes) / len(self._outcomes)
 
     @property
     def recent_median_latency(self):
-        """Median response latency (seconds) over the current rolling window.
-
-        Args:
-            None.
-
-        Returns:
-            Float, or None if no successful requests have been recorded yet.
-        """
+        """Return the median successful-request latency, or None."""
         with self._lock:
             if not self._latencies:
                 return None
@@ -258,33 +150,22 @@ class LastFmRequestMonitor:
             return ordered[len(ordered) // 2]
 
     def summary(self):
-        """Human-readable one-line summary of request health for this run.
-
-        Intended to be printed at the end of a run as an explicit check,
-        rather than relying solely on alerts having fired mid-run.
-
-        Args:
-            None.
-
-        Returns:
-            str.
-        """
+        """Return a concise request-health summary."""
         with self._lock:
             baseline = f"{self.baseline_latency:.3f}s" if self.baseline_latency is not None else "n/a"
             recent = self.recent_median_latency
-            recent_str = f"{recent:.3f}s" if recent is not None else "n/a"
-            drift = ""
-            if self.baseline_latency is not None and recent is not None:
-                ratio = recent / self.baseline_latency
-                drift = f" ({ratio:.1f}x baseline)"
+            recent_text = f"{recent:.3f}s" if recent is not None else "n/a"
+            drift = f" ({recent / self.baseline_latency:.1f}x baseline)" if recent is not None and self.baseline_latency else ""
             return (
-                f"Last.fm key ...{self.api_key[-4:]}: {self.total_requests} requests total, "
-                f"{self.total_errors} errors, {self.total_throttled} throttled (429). "
-                f"Latency baseline {baseline}, recent median {recent_str}{drift}."
+                f"Last.fm key ...{self.api_key[-4:]}: {self.total_requests} requests, "
+                f"{self.total_errors} errors, {self.total_throttled} throttled; "
+                f"latency baseline {baseline}, recent median {recent_text}{drift}."
             )
 
 
 class SongRadio:
+    """Generate and rank Spotify recommendations using Last.fm metadata."""
+
     LASTFM_JUNK_TAGS = {
         "seen live", "favorites", "favourite", "favourites", "amazing", "awesome",
         "love", "beautiful", "usa", "american", "uk", "british", "australian",
@@ -292,86 +173,26 @@ class SongRadio:
         "guilty pleasure", "guilty pleasures", "classic", "classics", "legend",
         "legendary", "under 2000 listeners", "spotify", "all",
     }
-    # Typical suffixes that mark a different "version" of the same song
-    VERSION_SUFFIX_PATTERNS = [
-        r"\s*-\s*\d{4}\s*remaster(ed)?.*$", r"\s*-\s*remaster(ed)?.*$",
-        r"\s*\(\s*\d{4}\s*remaster(ed)?.*?\)", r"\s*\(remaster(ed)?.*?\)",
-        r"\s*-\s*live.*$", r"\s*\(live.*?\)",
-        r"\s*-\s*radio edit.*$", r"\s*\(radio edit\)",
-        r"\s*-\s*single version.*$", r"\s*\(single version\)",
-        r"\s*-\s*mono.*$", r"\s*-\s*stereo.*$",
-        r"\s*-\s*deluxe.*$", r"\s*\(deluxe.*?\)",
-        r"\s*-\s*bonus track.*$", r"\s*\(bonus track\)",
-        r"\s*-\s*acoustic.*$", r"\s*\(acoustic.*?\)",
-        r"\s*-\s*instrumental.*$", r"\s*\(instrumental\)",
-        r"\s*\(explicit\)", r"\s*\(clean\)",
-        r"\s*\(feat\..*?\)", r"\s*\(with .*?\)",
-        # Generic catch-all for named/edited re-issues of the same
-        # recording that don't match one of the exact phrases above -
-        # "Single Edit" (vs. the "single version" phrase already covered),
-        # "Special Edition", "<Producer Name> Album Mix", "<Anything>
-        # Radio Mix", etc. \b...\b keeps this from matching inside a
-        # longer word (so "Remix", "Mixed", "Versions" are untouched -
-        # e.g. a named remix like "- PNAU Remix" is left as its own
-        # distinct entry, only a bare trailing "mix"/"edit"/"version"/
-        # "edition" (optionally with arbitrary words in front, as long as
-        # there's no further " - " in between) triggers this.
-        r"\s*-\s*[^-]*\b(?:edit|mix|version|edition|anniversary|extended|demo|reissue|expanded|alternate)\b.*$",
-        r"\s*\([^()]*\b(?:edit|mix|version|edition|anniversary|extended|demo|reissue|expanded|alternate)\b[^()]*\)",
-    ]
+    MIN_TRACK_DURATION_MS = 60_000
+    RATE_LIMIT_AUTO_RETRY_THRESHOLD = 30
+    MAX_UNKNOWN_429_RETRIES = 2
+    MAX_RETRY_AFTER_SECONDS = 60
+    PERSISTED_TAGS_LIMIT = 50
+    PERSISTED_TOP_TRACKS_LIMIT = 20
+    PERSISTED_SIMILAR_LIMIT = 30
 
-    MIN_TRACK_DURATION_MS = 60_000  # tracks shorter than this are filtered out by default
-    RATE_LIMIT_AUTO_RETRY_THRESHOLD = 30  # seconds - above this: abort immediately instead of waiting
-    MAX_UNKNOWN_429_RETRIES = 2  # short retries for a 429 with no usable Retry-After before hard-aborting
-
-    # Fast pre-checks used by is_allowed_language before falling back to the
-    # full langdetect model (the actual cost driver there - its n-gram
-    # profiling runs regardless of how obvious the answer is). Each check
-    # only ever returns a confident True/False; anything less clear-cut
-    # defers to the full model, so accuracy for ambiguous titles is
-    # unchanged - this only skips the model for cases cheap evidence
-    # already settles.
     _NON_LATIN_SCRIPT_RE = re.compile(
-        "[\u0400-\u04FF\u0370-\u03FF\u0590-\u05FF\u0600-\u06FF"   # Cyrillic, Greek, Hebrew, Arabic
-        "\u0900-\u097F\u0E00-\u0E7F\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7A3]"  # Devanagari, Thai, Kana/CJK, Hangul
+        "[\u0400-\u04FF\u0370-\u03FF\u0590-\u05FF\u0600-\u06FF"
+        "\u0900-\u097F\u0E00-\u0E7F\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7A3]"
     )
-    # Languages whose script falls in the ranges above (i.e. not
-    # expressible in near-pure Latin script). A title dominated by one of
-    # those scripts can only be confidently *rejected* without running the
-    # full model if none of allowed_languages could plausibly be it.
     _NON_LATIN_LANGUAGES = {
         "ru", "uk", "bg", "sr", "el", "he", "yi", "ar", "fa", "ur",
         "hi", "mr", "ne", "th", "ja", "zh", "zh-cn", "zh-tw", "ko",
     }
-    # Very common, near-unambiguous words for the languages this system is
-    # actually configured with in practice. A match lets a title be
-    # accepted without running the full model; a miss just falls through
-    # to it - so this can only ever be too permissive, in the same
-    # direction the "too short/uncertain -> let it through" exception
-    # handler below already is, never too strict.
     _STOPWORD_PATTERNS = {
-        "en": re.compile(r"\b(the|and|you|your|love|with|for|of|in|on|to|me|my|we)\b", re.IGNORECASE),
-        "de": re.compile(r"\b(und|nicht|ich|der|die|das|mit|für|auf|ist|ein|eine|kein|dich|mich|wir)\b", re.IGNORECASE),
+        "en": re.compile(r"\b(the|and|you|your|love|with|for|of|in|on|to|me|my|we)\b", re.I),
+        "de": re.compile(r"\b(und|nicht|ich|der|die|das|mit|für|auf|ist|ein|eine|kein|dich|mich|wir)\b", re.I),
     }
-
-    # Persisted Last.fm cache: always fetch/store this many tags/top-tracks
-    # regardless of what a given call site's `limit` or instance's
-    # artist_top_hit_exclude_n happens to be, and slice locally on read -
-    # so the on-disk cache stays valid and reusable across calls/runs that
-    # ask for different limits, instead of needing a re-fetch whenever a
-    # larger limit is requested than what was originally cached.
-    PERSISTED_TAGS_LIMIT = 50
-    PERSISTED_TOP_TRACKS_LIMIT = 20
-    # Similar-artist list from Last.fm's own collaborative-filtering
-    # signal (artist.getSimilar) - always fetch/store this many regardless
-    # of the run's lastfm_similar_artist_count/thin_tag_similar_artist_count,
-    # for the same cache-reusability reason as the two limits above.
-    PERSISTED_SIMILAR_LIMIT = 30
-    # Maps a logical artist-info field to its (value_column, fetched_at_column)
-    # pair in the lastfm_artists table - see _load_persisted_artist_field /
-    # _save_persisted_artist_field. Internal, fixed set of keys only (never
-    # built from external input), so it's safe to use for f-string column
-    # names in those helpers.
     _ARTIST_FIELD_COLUMNS = {
         "tags": ("tags_json", "tags_fetched_at"),
         "listeners": ("listeners", "listeners_fetched_at"),
@@ -381,18 +202,14 @@ class SongRadio:
 
     def __init__(
         self,
-        # --- Spotify / Last.fm connection ---
         client_id: str,
         client_secret: str,
         redirect_uri: str,
         lastfm_api_key: str,
-        # --- Seed configuration ---
         seed_queries: dict,
         include_seed_tracks: bool = True,
-        # --- Output shaping ---
         result_limit: int = 15,
         similarity_oversample_factor: int = 3,
-        # --- Candidate gathering ---
         genres_to_use: int = 5,
         genre_pool_multiplier: int = 2,
         results_per_turn: int = 10,
@@ -403,26 +220,21 @@ class SongRadio:
         min_fresh_fraction: float = 0.2,
         max_candidate_expansion_rounds: int = 5,
         min_discovered_genre_count: int = 2,
-        # --- Last.fm similar-artist discovery & scoring ---
         lastfm_similar_artist_count: int = 8,
         thin_tag_genre_threshold: int = 4,
         thin_tag_similar_artist_count: int = 25,
         similarity_blend_weight_range: tuple = (0.2, 0.5),
         popularity_bias: float = 0.0,
-        # --- Filtering thresholds ---
         min_artist_listeners: int = 1_000,
         lastfm_listener_ceiling: int = 150_000,
         min_track_listeners: int = 0,
         artist_top_hit_exclude_n: int = 5,
-        allowed_languages: list = ["en", "de"],
-        excluded_artists: list = [],
-        excluded_genres: list = [],
-        # --- Local Spotify search cache ---
+        allowed_languages=None,
+        excluded_artists=None,
+        excluded_genres=None,
         cache_path: str = "spotify_search_cache.db",
         cache_ttl_days: float = 30,
-        # --- Persisted Last.fm cache ---
         lastfm_cache_ttl_days: float = 14,
-        # --- Last.fm concurrency / resilience ---
         lastfm_max_workers: int = 4,
         lastfm_batch_size: int = 12,
         lastfm_max_retries: int = 4,
@@ -432,194 +244,34 @@ class SongRadio:
         lastfm_monitor_window: int = 40,
         lastfm_latency_alert_multiplier: float = 2.0,
         lastfm_baseline_sample_size: int = 20,
+        max_tracks_per_artist: int = 2,
+        max_2hop_artists: int = 20,
     ):
-        """Initializes the Spotify/Last.fm clients and stores the configuration.
+        """Initialize clients, configuration, worker pool, and local caches."""
+        positive_ints = {
+            "result_limit": result_limit,
+            "similarity_oversample_factor": similarity_oversample_factor,
+            "lastfm_max_workers": lastfm_max_workers,
+            "lastfm_batch_size": lastfm_batch_size,
+            "lastfm_max_retries": lastfm_max_retries,
+            "max_tracks_per_artist": max_tracks_per_artist,
+        }
+        for name, value in positive_ints.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if isinstance(max_2hop_artists, bool) or not isinstance(max_2hop_artists, int) or max_2hop_artists < 0:
+            raise ValueError("max_2hop_artists must be a nonnegative integer")
+        if not 0 <= min_fresh_fraction <= 1:
+            raise ValueError("min_fresh_fraction must be between 0 and 1")
+        if len(similarity_blend_weight_range) != 2 or not 0 <= similarity_blend_weight_range[0] <= similarity_blend_weight_range[1] <= 1:
+            raise ValueError("similarity_blend_weight_range must satisfy 0 <= min <= max <= 1")
+        if lastfm_backoff_base < 0:
+            raise ValueError("lastfm_backoff_base must be nonnegative")
+        if lastfm_cache_ttl_days < 0 or cache_ttl_days < 0:
+            raise ValueError("Cache TTL values must be nonnegative")
+        if not isinstance(seed_queries, dict):
+            raise TypeError("seed_queries must be a dictionary")
 
-        Args:
-            client_id: Spotify app client ID.
-            client_secret: Spotify app client secret.
-            redirect_uri: Spotify app redirect URI (for the OAuth flow).
-            lastfm_api_key: Last.fm API key (genre/listener count data).
-            seed_queries: Mapping {artist name: song title} used as the
-                starting point for the recommendations.
-            include_seed_tracks: Whether the seed tracks themselves should be
-                included in the playlist created later.
-            result_limit: Number of tracks returned at the end.
-            similarity_oversample_factor: How many times result_limit worth
-                of filter-passing candidates to gather before ranking by
-                genre similarity to the seeds and keeping the best
-                result_limit. Higher values give better similarity ranking
-                at the cost of more Last.fm requests.
-            genres_to_use: Number of (most specific) genres used for the
-                genre search, per round.
-            genre_pool_multiplier: Widens the genre candidate pool to
-                genres_to_use * genre_pool_multiplier before randomly
-                sampling genres_to_use from it, so the same seeds don't
-                always search the exact same genres every run.
-            results_per_turn: Results requested per query per round-robin
-                turn (see build_candidate_pool).
-            max_results_per_genre: Upper bound on search results per genre query.
-            max_results_per_seed_artist: Upper bound on search results per
-                seed artist query.
-            max_results_per_similar_artist: Upper bound on search results
-                per query for an artist discovered via
-                lastfm_similar_artist_count/thin_tag_similar_artist_count
-                (see _ensure_seed_similar_artists). Kept smaller than
-                max_results_per_seed_artist by default since there are
-                typically many more similar artists than seeds.
-            target_total_candidates: Desired candidate pool size.
-                build_candidate_pool treats this as a target to actively
-                work toward - if the initial genre/seed-artist search comes
-                up short, additional not-yet-tried genres are queried (up
-                to max_candidate_expansion_rounds) before giving up and
-                reporting a genuine shortfall.
-            min_fresh_fraction: Minimum fraction (0-1) of the final
-                candidate pool that must come from tracks fetched live from
-                Spotify this run, as opposed to replayed from the local
-                search cache. If the initial search comes in under this,
-                additional not-yet-tried genres are queried (subject to the
-                same max_candidate_expansion_rounds budget) to raise it.
-            max_candidate_expansion_rounds: Safety cap on how many extra
-                genre-search rounds build_candidate_pool will run while
-                trying to reach target_total_candidates / min_fresh_fraction,
-                so a persistently thin genre neighborhood can't loop
-                indefinitely.
-            min_discovered_genre_count: Once the genres originally derived
-                from the seed artists' own Last.fm tags are exhausted,
-                further expansion rounds "snowball" into genres found on
-                the candidate artists discovered so far. A newly-seen genre
-                only becomes eligible for this snowball expansion once it
-                has appeared on at least this many distinct candidate
-                artists - since those artists were themselves already
-                found via a genre/artist search relevant to the seeds, a
-                tag repeatedly co-occurring among them is a meaningfully
-                related sub-genre rather than a one-off/noise tag.
-            lastfm_similar_artist_count: Number of Last.fm
-                collaborative-filtering "similar artists" (artist.getSimilar)
-                fetched per seed artist and used as a third candidate-search
-                source in build_candidate_pool, alongside genre search and
-                the seed artists' own catalogs - a signal independent of
-                tag/genre data, since it comes from Last.fm's own listening
-                co-occurrence graph. One Last.fm request per seed artist
-                regardless of this count (cached like every other Last.fm
-                lookup here), so raising it doesn't add API calls, only
-                more Spotify search queries within the existing
-                target_total_candidates budget.
-            thin_tag_genre_threshold: If the seed(s)' own Last.fm tags
-                number fewer than this after blocklist filtering (e.g. a
-                regional/dialect act with sparse tagging, where genre
-                search and its snowball expansion have structurally little
-                to work with), thin_tag_similar_artist_count is used
-                instead of lastfm_similar_artist_count - leaning candidate
-                discovery more heavily on the collaborative signal exactly
-                where the tag-based one is weakest.
-            thin_tag_similar_artist_count: See thin_tag_genre_threshold.
-            similarity_blend_weight_range: (min, max) range a blend weight
-                is sampled from, once per filter_and_rank run (not per
-                candidate, so scoring stays internally consistent within a
-                run while still varying run to run), and used to blend
-                Last.fm's artist.getSimilar "match" score into a
-                candidate's similarity score wherever its artist appears
-                in a seed's similar-artist list: `similarity = (1-w)*tag_
-                jaccard + w*lastfm_match`. Candidates whose artist isn't in
-                that list keep pure tag-Jaccard similarity, unaffected.
-                Sampling the weight per run (rather than fixing it) adds a
-                bit of deliberate run-to-run result variety on top of the
-                existing randomized genre sampling.
-            popularity_bias: Steers final ranking toward more (positive) or
-                less (negative) popular tracks, based on each candidate's
-                percentile rank in track listeners *within this run's
-                scored pool* (not a fixed absolute threshold, so it scales
-                sensibly across genres/pools with very different absolute
-                popularity levels). 0 (default) leaves ranking unaffected.
-                Applied as a pure post-processing step on already-fetched
-                data - no extra API calls. Practical useful range is
-                roughly -0.3 to 0.3; larger magnitudes increasingly
-                override genre/collaborative similarity rather than
-                nudging it.
-            min_artist_listeners: Minimum total listener count an artist must
-                have on Last.fm to be considered a candidate.
-            lastfm_listener_ceiling: Maximum listener count a single track may
-                have on Last.fm to still count as a "hidden gem".
-            min_track_listeners: Minimum Last.fm listener count a single
-                track must have to be considered (filters out tracks with
-                barely any listeners). 0 disables this floor.
-            artist_top_hit_exclude_n: Number of an artist's most-listened
-                tracks that count as "used up" and get excluded.
-            allowed_languages: Set of allowed language codes (e.g. "en", "de")
-                for the song title language detection.
-            excluded_artists: Artist names that should never appear as candidates.
-            excluded_genres: Genre tags that should never be used as a search
-                term and whose artists get hard-excluded.
-            cache_path: Path to the local SQLite database used to persist
-                Spotify search results across runs, so identical queries
-                don't re-fetch already-seen offsets and instead explore new
-                ones. Individual queries/tracks are inserted or updated as
-                their own rows, so recording progress never requires
-                rewriting the whole cache - unlike the previous JSON-based
-                format, this scales with what changed, not with how much
-                has accumulated across every prior run.
-            cache_ttl_days: After how many days a cached query's exploration
-                state (offsets_fetched/exhausted) is reset so it gets
-                re-scanned from offset 0, to catch drift in Spotify's ranking.
-                Set to 0 to disable expiration entirely.
-            lastfm_cache_ttl_days: After how many days a persisted Last.fm
-                artist/track cache entry (tags, listeners, top tracks - see
-                the lastfm_artists/lastfm_tracks tables in the same SQLite
-                file as cache_path) is treated as stale and re-fetched
-                instead of reused. Separate from cache_ttl_days since
-                Last.fm data (listener counts especially) drifts on its own
-                timescale, independent of how often Spotify's search
-                ranking is re-scanned. Set to 0 to disable expiration
-                entirely.
-            lastfm_max_workers: Maximum number of concurrent Last.fm requests
-                in a batch. This is a ceiling, not a fixed value - the
-                effective concurrency adapts downward if 429s are observed
-                (see LastFmRequestMonitor) and only cautiously climbs back
-                toward this ceiling afterward.
-            lastfm_batch_size: Number of pool tracks processed together per
-                concurrent batch in filter_and_rank. Larger batches use
-                concurrency more efficiently but risk overshooting the
-                early-stop target (oversample_target) by up to one batch's
-                worth of unnecessary Last.fm lookups.
-            lastfm_max_retries: Maximum attempts (including the first) for a
-                single Last.fm request before giving up and treating it as
-                failed (returns None/empty for that lookup).
-            lastfm_backoff_base: Base delay in seconds for exponential
-                backoff between retries (delay ~= base * 2**attempt, plus
-                jitter). Also used as a fallback when a 429 response has no
-                usable Retry-After header.
-            lastfm_throttle_rate_alert: Rolling 429 rate (see
-                LastFmRequestMonitor) at or above which concurrency is
-                reduced and an alert is logged.
-            lastfm_error_rate_alert: Rolling network/5xx error rate at or
-                above which an alert is logged.
-            lastfm_monitor_window: Number of most recent Last.fm requests
-                considered when computing rolling error/429 rates and
-                recent latency.
-            lastfm_latency_alert_multiplier: How many times slower than the
-                established baseline the recent median response latency
-                must become before an alert is logged (see
-                LastFmRequestMonitor). Catches server-side slowdown even
-                when it never escalates to an outright 429.
-            lastfm_baseline_sample_size: Number of early requests used to
-                establish the "normal" latency baseline.
-
-        Returns:
-            None.
-        """
-        if lastfm_max_retries < 1:
-            raise ValueError("lastfm_max_retries must be at least 1")
-        if lastfm_max_workers < 1:
-            raise ValueError("lastfm_max_workers must be at least 1")
-        if lastfm_batch_size < 1:
-            raise ValueError("lastfm_batch_size must be at least 1")
-        if result_limit < 1:
-            raise ValueError("result_limit must be at least 1")
-        if similarity_oversample_factor < 1:
-            raise ValueError("similarity_oversample_factor must be at least 1")
-
-        # --- Spotify / Last.fm connection ---
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyOAuth(
                 client_id=client_id,
@@ -628,24 +280,19 @@ class SongRadio:
                 scope="user-library-read playlist-read-private playlist-modify-private playlist-modify-public",
                 show_dialog=True,
             ),
-            retries=0,  # otherwise spotipy would sleep the full Retry-After itself (possibly hours)
+            retries=0,
             requests_timeout=10,
         )
         self.lastfm_api_key = lastfm_api_key
-
-        # --- Seed configuration ---
-        self.seed_queries = seed_queries
+        self.seed_queries = dict(seed_queries)
         self.include_seed_tracks = include_seed_tracks
-        self.seed_tracks = []  # full track objects, for playlist inclusion
+        self.seed_tracks = []
         self.seed_artist_names = []
-        self.seed_genre_set = set()  # populated by get_seed_artist_ids_and_genres
-
-        # --- Output shaping ---
-        self.result_limit = result_limit
-        self.similarity_oversample_factor = similarity_oversample_factor
+        self.seed_genre_set = set()
         self.picks = []
 
-        # --- Candidate gathering ---
+        self.result_limit = result_limit
+        self.similarity_oversample_factor = similarity_oversample_factor
         self.genres_to_use = genres_to_use
         self.genre_pool_multiplier = genre_pool_multiplier
         self.results_per_turn = results_per_turn
@@ -656,85 +303,50 @@ class SongRadio:
         self.min_fresh_fraction = min_fresh_fraction
         self.max_candidate_expansion_rounds = max_candidate_expansion_rounds
         self.min_discovered_genre_count = min_discovered_genre_count
-
-        # --- Last.fm similar-artist discovery & scoring ---
         self.lastfm_similar_artist_count = lastfm_similar_artist_count
         self.thin_tag_genre_threshold = thin_tag_genre_threshold
         self.thin_tag_similar_artist_count = thin_tag_similar_artist_count
         self.similarity_blend_weight_range = similarity_blend_weight_range
         self.popularity_bias = popularity_bias
-        self._similar_artists_cache = {}  # in-memory: (artist_name, limit) -> list[(name, match)]
-        self._similar_artist_pool_names = None  # populated once by _ensure_seed_similar_artists
-        self.seed_similar_match = {}  # lowercased artist name -> best Last.fm match score across seeds
-
-        # --- Filtering thresholds ---
         self.min_artist_listeners = min_artist_listeners
         self.lastfm_listener_ceiling = lastfm_listener_ceiling
         self.min_track_listeners = min_track_listeners
         self.artist_top_hit_exclude_n = artist_top_hit_exclude_n
-        self.allowed_languages = set(allowed_languages)
-        self.excluded_artists = {a.lower() for a in excluded_artists}
-        self.excluded_genres = {g.lower() for g in excluded_genres}
+        self.allowed_languages = set(allowed_languages if allowed_languages is not None else ["en", "de"])
+        self.excluded_artists = {normalize_artist_name(name) for name in (excluded_artists or [])}
+        self.excluded_genres = {str(genre).casefold() for genre in (excluded_genres or [])}
+        self.max_tracks_per_artist = max_tracks_per_artist
+        self.max_2hop_artists = max_2hop_artists
 
-        # --- Local Spotify search cache ---
         self.cache_path = cache_path
         self.cache_ttl_days = cache_ttl_days
-        self._search_db = self._init_search_db(cache_path)
-        self.search_limit = 10  # Spotify maximum since Feb 2026
-        self.request_sleep = 0.2  # a bit generous, to avoid bursts
-        self._max_offset = 990  # safety cap for offset pagination
-
-        # --- Persisted Last.fm cache (same SQLite file as cache_path,
-        # tables created above by _init_search_db) ---
         self.lastfm_cache_ttl_days = lastfm_cache_ttl_days
-        # self._search_db is main-thread-only by design (Spotify search
-        # caching isn't parallelized - see _init_search_db's docstring), but
-        # Last.fm lookups run concurrently from the executor's worker
-        # threads (see _run_concurrent), so persisting them needs a
-        # connection that's actually safe to use from those threads. A
-        # second connection to the same file, rather than reusing
-        # self._search_db across threads, keeps that existing
-        # single-thread invariant intact. All access to this connection is
-        # serialized through self._cache_lock below - SQLite only allows
-        # one writer at a time on a given file regardless, so this doesn't
-        # add meaningful contention beyond what the in-memory caches
-        # guarded by the same lock already have.
-        self._lastfm_db = sqlite3.connect(cache_path, check_same_thread=False)
+        self._search_db = self._init_search_db(cache_path)
+        self._lastfm_db = sqlite3.connect(cache_path, check_same_thread=False, timeout=30)
         self._lastfm_db.execute("PRAGMA journal_mode=WAL")
+        self._cache_lock = threading.RLock()
 
-        # --- Last.fm-side lookup caches (artist tags/listeners/top-tracks) ---
         self._artist_stats_cache = {}
         self._top_tracks_cache = {}
         self._tags_cache = {}
         self._track_listeners_cache = {}
+        self._similar_artists_cache = {}
         self._artist_info_cache = {}
-        self._cache_lock = threading.Lock()
+        self._similar_artist_pool_names = None
+        self._two_hop_artist_pool_names = None
+        self.seed_similar_match = {}
 
-        # --- Last.fm concurrency / resilience ---
         self.lastfm_max_workers = lastfm_max_workers
         self.lastfm_batch_size = lastfm_batch_size
         self.lastfm_max_retries = lastfm_max_retries
         self.lastfm_backoff_base = lastfm_backoff_base
-        # Created once and reused for every batch (see _run_concurrent) rather
-        # than per-batch, to avoid repeated thread creation/teardown overhead
-        # and to keep total OS thread count bounded by lastfm_max_workers for
-        # the whole run - both for real overhead and for readable profiler output.
-        self._lastfm_executor = ThreadPoolExecutor(max_workers=lastfm_max_workers, thread_name_prefix="lastfm")
-        # A plain module-level requests.get(...) call opens and tears down a
-        # brand-new Session (and thus a brand-new connection pool) on every
-        # single call, forcing a fresh TCP+TLS handshake per request even
-        # though almost all Last.fm requests go to the same host. A single
-        # persistent Session with a pool sized to lastfm_max_workers lets
-        # concurrent requests reuse keep-alive connections instead. Sharing
-        # one Session across the executor's worker threads is safe here:
-        # urllib3's underlying connection pool (which is what actually
-        # matters for concurrent access) is internally thread-safe, and no
-        # per-request Session state (cookies, auth, etc.) is used.
-        self._lastfm_session = requests.Session()
-        pool_size = max(lastfm_max_workers, 10)  # never shrink below requests' own default
-        self._lastfm_session.mount(
-            "https://", HTTPAdapter(pool_connections=1, pool_maxsize=pool_size)
+        self._lastfm_executor = ThreadPoolExecutor(
+            max_workers=lastfm_max_workers,
+            thread_name_prefix="lastfm",
         )
+        self._session_local = threading.local()
+        self._sessions = []
+        self._sessions_lock = threading.Lock()
         self._lastfm_monitor = LastFmRequestMonitor(
             api_key=lastfm_api_key,
             window_size=lastfm_monitor_window,
@@ -743,288 +355,201 @@ class SongRadio:
             latency_alert_multiplier=lastfm_latency_alert_multiplier,
             baseline_sample_size=lastfm_baseline_sample_size,
         )
+        self.search_limit = 10
+        self.request_sleep = 0.2
+        self._max_offset = 990
+
+    def _get_lastfm_session(self):
+        """Return a persistent requests session owned by the current thread."""
+        session = getattr(self._session_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            pool_size = max(self.lastfm_max_workers, 10)
+            session.mount("https://", HTTPAdapter(pool_connections=1, pool_maxsize=pool_size))
+            self._session_local.session = session
+            with self._sessions_lock:
+                self._sessions.append(session)
+        return session
 
     def lastfm_health_summary(self):
-        """Human-readable summary of Last.fm request health for this run.
-
-        Prints total requests/errors/429s and how the recent median
-        response latency compares to the baseline established early in the
-        run - an explicit, always-available check for server-side
-        slowdown, rather than relying solely on alerts having fired.
-
-        Args:
-            None.
-
-        Returns:
-            str.
-        """
+        """Return a summary of Last.fm request health for this run."""
         return self._lastfm_monitor.summary()
 
-    # --- Last.fm helpers -----------------------------------------------
+    _LASTFM_FAILURE = object()
 
     def _lastfm_get(self, method, **params):
-        """Performs a GET request against the Last.fm API with retry/backoff.
-
-        There's no confirmed hard rate limit on the Last.fm API, so a 429 is
-        treated as an early warning rather than a hard wall: it's retried
-        with exponential backoff (respecting a Retry-After header if
-        present) rather than failing immediately. Every outcome (ok, error,
-        throttled) is recorded in self._lastfm_monitor, which is what the
-        concurrent fetch layer in filter_and_rank uses to decide whether to
-        reduce concurrency.
-
-        Args:
-            method: Name of the Last.fm API method (e.g. "artist.getInfo").
-            **params: Additional query parameters for the request
-                (e.g. artist=..., track=..., limit=...).
-
-        Returns:
-            The JSON-decoded response as a dict, or an empty dict if every
-            attempt failed.
-        """
-        max_attempts = self.lastfm_max_retries
-        base_delay = self.lastfm_backoff_base
-
-        for attempt in range(max_attempts):
-            is_last_attempt = attempt == max_attempts - 1
-            request_start = time.monotonic()
-
+        """Request a Last.fm API method with bounded retries and backoff."""
+        for attempt in range(self.lastfm_max_retries):
+            started = time.monotonic()
             try:
-                resp = self._lastfm_session.get(
+                response = self._get_lastfm_session().get(
                     "https://ws.audioscrobbler.com/2.0/",
                     params={"method": method, "api_key": self.lastfm_api_key, "format": "json", **params},
                     timeout=5,
                 )
-            except requests.RequestException as e:
+            except requests.RequestException as exc:
                 self._lastfm_monitor.record("error")
-                if is_last_attempt:
-                    logger.warning("Last.fm request failed after %d attempts (%s): %s", max_attempts, method, e)
-                    return {}
-                time.sleep(base_delay * (2 ** attempt) + random.uniform(0, base_delay))
+                if attempt + 1 == self.lastfm_max_retries:
+                    logger.warning("Last.fm request failed for %s: %s", method, exc)
+                    return self._LASTFM_FAILURE
+                time.sleep(self.lastfm_backoff_base * (2 ** attempt) + random.uniform(0, self.lastfm_backoff_base))
                 continue
 
-            if resp.status_code == 429:
+            if response.status_code == 429:
                 self._lastfm_monitor.record("throttled")
-                if is_last_attempt:
-                    logger.warning(
-                        "Last.fm kept returning 429 for %s after %d attempts, giving up on this call.",
-                        method, max_attempts,
-                    )
-                    return {}
-                retry_after = resp.headers.get("Retry-After")
-                if retry_after is not None:
-                    try:
-                        delay = float(retry_after)
-                    except ValueError:
-                        delay = base_delay * (2 ** attempt)
-                else:
-                    delay = base_delay * (2 ** attempt) + random.uniform(0, base_delay)
-                delay = min(max(delay, 0.0), 60.0)
-                time.sleep(delay)
+                if attempt + 1 == self.lastfm_max_retries:
+                    logger.warning("Last.fm returned 429 for %s after %d attempts.", method, self.lastfm_max_retries)
+                    return self._LASTFM_FAILURE
+                try:
+                    delay = float(response.headers.get("Retry-After", ""))
+                except (TypeError, ValueError):
+                    delay = self.lastfm_backoff_base * (2 ** attempt) + random.uniform(0, self.lastfm_backoff_base)
+                time.sleep(min(max(delay, 0.0), self.MAX_RETRY_AFTER_SECONDS))
                 continue
 
-            if resp.status_code >= 500:
+            if response.status_code >= 500:
                 self._lastfm_monitor.record("error")
-                if is_last_attempt:
-                    logger.warning("Last.fm returned %d for %s after %d attempts, giving up.",
-                                    resp.status_code, method, max_attempts)
-                    return {}
-                time.sleep(base_delay * (2 ** attempt) + random.uniform(0, base_delay))
+                if attempt + 1 == self.lastfm_max_retries:
+                    logger.warning("Last.fm returned HTTP %d for %s.", response.status_code, method)
+                    return self._LASTFM_FAILURE
+                time.sleep(self.lastfm_backoff_base * (2 ** attempt) + random.uniform(0, self.lastfm_backoff_base))
                 continue
 
             try:
-                data = resp.json()
-                if resp.status_code >= 400 or "error" in data:
-                    self._lastfm_monitor.record("error")
-                    logger.warning(
-                        "Last.fm API error for %s (HTTP %s): %s",
-                        method,
-                        resp.status_code,
-                        data.get("message", resp.reason),
-                    )
-                    return {}
-            except ValueError as e:
+                data = response.json()
+            except ValueError as exc:
                 self._lastfm_monitor.record("error")
-                logger.warning("Last.fm response for %s was not valid JSON: %s", method, e)
-                return {}
+                logger.warning("Last.fm returned invalid JSON for %s: %s", method, exc)
+                return self._LASTFM_FAILURE
 
-            elapsed = time.monotonic() - request_start
-            self._lastfm_monitor.record("ok", latency=elapsed)
+            if response.status_code >= 400 or not isinstance(data, dict) or "error" in data:
+                code = data.get("error") if isinstance(data, dict) else None
+                if code == 29 and attempt + 1 < self.lastfm_max_retries:
+                    self._lastfm_monitor.record("throttled")
+                    time.sleep(min(self.lastfm_backoff_base * (2 ** attempt), self.MAX_RETRY_AFTER_SECONDS))
+                    continue
+                self._lastfm_monitor.record("error")
+                logger.warning(
+                    "Last.fm API error for %s (HTTP %d, code %s): %s",
+                    method, response.status_code, code, data.get("message") if isinstance(data, dict) else response.reason,
+                )
+                return self._LASTFM_FAILURE
+
+            self._lastfm_monitor.record("ok", time.monotonic() - started)
             return data
 
-        return {}
-
-    # --- Persisted Last.fm cache (SQLite, survives across runs) ---------
+        return self._LASTFM_FAILURE
 
     def _load_persisted_artist_field(self, artist_name, field):
-        """Reads one persisted Last.fm artist field, honoring the cache TTL.
-
-        Args:
-            artist_name: Name of the artist.
-            field: One of "tags", "listeners", "top_tracks" (keys of
-                _ARTIST_FIELD_COLUMNS).
-
-        Returns:
-            For "tags"/"top_tracks": a list[str] (already JSON-decoded, in
-            the order originally fetched). For "listeners": an int, or
-            None if Last.fm genuinely had no listener count for this
-            artist (a legitimate cached outcome, not a miss). In all
-            cases, the module-level _CACHE_MISS sentinel is returned
-            instead if the artist was never cached, this particular field
-            was never populated, or the entry is older than
-            self.lastfm_cache_ttl_days.
-        """
-        value_col, ts_col = self._ARTIST_FIELD_COLUMNS[field]
+        """Load one artist field from SQLite, respecting its independent TTL."""
+        value_col, timestamp_col = self._ARTIST_FIELD_COLUMNS[field]
+        key = normalize_artist_name(artist_name)
         with self._cache_lock:
             row = self._lastfm_db.execute(
-                f"SELECT {value_col}, {ts_col} FROM lastfm_artists WHERE artist_name = ?", (artist_name,)
+                f"SELECT {value_col}, {timestamp_col} FROM lastfm_artists WHERE artist_name = ?",
+                (key,),
             ).fetchone()
+
         if row is None:
             return _CACHE_MISS
-        value_raw, fetched_at = row
+
+        value, fetched_at = row
         if fetched_at is None:
-            return _CACHE_MISS  # row exists (some other field was cached) but not this one
-        if self.lastfm_cache_ttl_days and (time.time() - fetched_at) / 86400 > self.lastfm_cache_ttl_days:
+            return _CACHE_MISS
+        if self.lastfm_cache_ttl_days and time.time() - fetched_at > self.lastfm_cache_ttl_days * 86400:
             return _CACHE_MISS
         if field == "listeners":
-            return value_raw
-        return json.loads(value_raw) if value_raw is not None else []
+            return value
+        return json.loads(value) if value else []
 
     def _save_persisted_artist_field(self, artist_name, field, value):
-        """Upserts one persisted Last.fm artist field.
-
-        Only the given field's value/fetched_at columns are written - the
-        other two fields' columns (if already cached from a previous call)
-        are left untouched, since tags/listeners/top_tracks are fetched via
-        independent Last.fm API calls and may be populated at different
-        times (e.g. listeners in one batch pass, tags/top_tracks in a
-        later one - see _fetch_artist_infos_batch).
-
-        Args:
-            artist_name: Name of the artist.
-            field: One of "tags", "listeners", "top_tracks".
-            value: list[str] for "tags"/"top_tracks" (JSON-encoded before
-                storing); int or None for "listeners" (stored as-is).
-
-        Returns:
-            None.
-        """
-        value_col, ts_col = self._ARTIST_FIELD_COLUMNS[field]
-        stored = value if field == "listeners" else json.dumps(value)
+        """Save one Last.fm artist field without changing other cached fields."""
+        value_col, timestamp_col = self._ARTIST_FIELD_COLUMNS[field]
+        key = normalize_artist_name(artist_name)
+        stored = value if field == "listeners" else json.dumps(value, ensure_ascii=False)
+        display_name = artist_name.strip()
         with self._cache_lock:
             self._lastfm_db.execute(
-                f"INSERT INTO lastfm_artists (artist_name, {value_col}, {ts_col}) VALUES (?, ?, ?) "
-                f"ON CONFLICT(artist_name) DO UPDATE SET {value_col}=excluded.{value_col}, {ts_col}=excluded.{ts_col}",
-                (artist_name, stored, time.time()),
+                f"INSERT INTO lastfm_artists (artist_name, display_name, {value_col}, {timestamp_col}) "
+                f"VALUES (?, ?, ?, ?) ON CONFLICT(artist_name) DO UPDATE SET "
+                f"display_name=excluded.display_name, {value_col}=excluded.{value_col}, "
+                f"{timestamp_col}=excluded.{timestamp_col}",
+                (key, display_name, stored, time.time()),
             )
             self._lastfm_db.commit()
 
     def _load_persisted_track_listeners(self, artist_name, track_name):
-        """Reads a persisted per-track Last.fm listener count.
-
-        Args:
-            artist_name: Name of the artist.
-            track_name: Title of the track.
-
-        Returns:
-            int, or None if Last.fm genuinely had no listener count for
-            this track (a legitimate cached outcome). The module-level
-            _CACHE_MISS sentinel is returned instead if this (artist,
-            track) pair was never cached or the entry has expired.
-        """
+        """Load a track listener count from SQLite, respecting its TTL."""
+        artist_key = normalize_artist_name(artist_name)
+        track_key = normalize_track_title(track_name)
         with self._cache_lock:
             row = self._lastfm_db.execute(
                 "SELECT listeners, fetched_at FROM lastfm_tracks WHERE artist_name = ? AND track_name = ?",
-                (artist_name, track_name),
+                (artist_key, track_key),
             ).fetchone()
-        if row is None:
+
+        if row is None or row[1] is None:
             return _CACHE_MISS
-        listeners, fetched_at = row
-        if fetched_at is None:
+        if self.lastfm_cache_ttl_days and time.time() - row[1] > self.lastfm_cache_ttl_days * 86400:
             return _CACHE_MISS
-        if self.lastfm_cache_ttl_days and (time.time() - fetched_at) / 86400 > self.lastfm_cache_ttl_days:
-            return _CACHE_MISS
-        return listeners
+        return row[0]
 
     def _save_persisted_track_listeners(self, artist_name, track_name, listeners):
-        """Upserts a persisted per-track Last.fm listener count.
-
-        Args:
-            artist_name: Name of the artist.
-            track_name: Title of the track.
-            listeners: int, or None if Last.fm had no entry for this track.
-
-        Returns:
-            None.
-        """
+        """Save a track listener count using normalized artist/title keys."""
+        artist_key = normalize_artist_name(artist_name)
+        track_key = normalize_track_title(track_name)
         with self._cache_lock:
             self._lastfm_db.execute(
-                "INSERT INTO lastfm_tracks (artist_name, track_name, listeners, fetched_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(artist_name, track_name) DO UPDATE SET "
-                "listeners=excluded.listeners, fetched_at=excluded.fetched_at",
-                (artist_name, track_name, listeners, time.time()),
+                "INSERT INTO lastfm_tracks (artist_name, track_name, display_name, listeners, fetched_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(artist_name, track_name) DO UPDATE SET "
+                "display_name=excluded.display_name, listeners=excluded.listeners, fetched_at=excluded.fetched_at",
+                (artist_key, track_key, track_name.strip(), listeners, time.time()),
             )
             self._lastfm_db.commit()
 
+    @staticmethod
+    def _as_list(value):
+        """Normalize an API field that may contain either one object or a list."""
+        if value is None:
+            return []
+        return value if isinstance(value, list) else [value]
+
     def lastfm_top_tags(self, artist_name, limit=8):
-        """Fetches the most-assigned Last.fm tags (genre/style) for an artist.
-
-        Checked in order: in-memory cache (lifetime of the instance) ->
-        persisted SQLite cache (survives across runs, see
-        _load_persisted_artist_field, subject to lastfm_cache_ttl_days) ->
-        live Last.fm request. A live fetch always retrieves and persists
-        PERSISTED_TAGS_LIMIT tags regardless of this call's `limit`, so a
-        later call with a different limit can still be served from the
-        cache instead of triggering another request.
-
-        Args:
-            artist_name: Name of the artist.
-            limit: Maximum number of tags returned.
-
-        Returns:
-            List of tag names (lowercased), in descending order of frequency.
-            Empty list if no tags were found or the request failed.
-        """
-        cache_key = (artist_name, limit)
+        """Return an artist's most-used Last.fm tags."""
+        if limit <= 0:
+            return []
+        key = normalize_artist_name(artist_name)
+        cache_key = (key, limit)
         with self._cache_lock:
             cached = self._tags_cache.get(cache_key)
         if cached is not None:
-            return cached
+            return list(cached)
 
         persisted = self._load_persisted_artist_field(artist_name, "tags")
         if persisted is not _CACHE_MISS:
             tags = persisted[:limit]
-            with self._cache_lock:
-                self._tags_cache[cache_key] = tags
-            return tags
+        else:
+            data = self._lastfm_get("artist.getTopTags", artist=artist_name)
+            if data is self._LASTFM_FAILURE:
+                return []
+            raw = data.get("toptags", {}).get("tag", [])
+            tags = [
+                str(tag["name"]).casefold()
+                for tag in self._as_list(raw)[:self.PERSISTED_TAGS_LIMIT]
+                if isinstance(tag, dict) and tag.get("name")
+            ]
+            self._save_persisted_artist_field(artist_name, "tags", tags)
+            tags = tags[:limit]
 
-        data = self._lastfm_get("artist.getTopTags", artist=artist_name)
-        assert data is not None
-        tags_raw = data.get("toptags", {}).get("tag", [])
-        all_tags = [t["name"].lower() for t in tags_raw[: self.PERSISTED_TAGS_LIMIT] if t.get("name")]
-        tags = all_tags[:limit]
-
-        self._save_persisted_artist_field(artist_name, "tags", all_tags)
         with self._cache_lock:
-            self._tags_cache[cache_key] = tags
+            self._tags_cache[cache_key] = list(tags)
         return tags
 
     def lastfm_track_listeners(self, artist_name, track_name):
-        """Fetches the listener count of a single track from Last.fm.
-
-        Checked in order: in-memory cache (lifetime of the instance) ->
-        persisted SQLite cache (survives across runs, subject to
-        lastfm_cache_ttl_days) -> live Last.fm request.
-
-        Args:
-            artist_name: Name of the artist.
-            track_name: Title of the track.
-
-        Returns:
-            Number of listeners as an int, or None if no Last.fm entry was
-            found or the request failed.
-        """
-        cache_key = (artist_name, track_name)
+        """Return the Last.fm listener count for a track, or None if unavailable."""
+        artist_key = normalize_artist_name(artist_name)
+        track_key = normalize_track_title(track_name)
+        cache_key = (artist_key, track_key)
         with self._cache_lock:
             cached = self._track_listeners_cache.get(cache_key, _CACHE_MISS)
         if cached is not _CACHE_MISS:
@@ -1037,10 +562,12 @@ class SongRadio:
             return persisted
 
         data = self._lastfm_get("track.getInfo", artist=artist_name, track=track_name)
-        assert data is not None
+        if data is self._LASTFM_FAILURE:
+            return None
+
         try:
             listeners = int(data["track"]["listeners"])
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, TypeError, ValueError):
             listeners = None
 
         self._save_persisted_track_listeners(artist_name, track_name, listeners)
@@ -1049,1886 +576,1340 @@ class SongRadio:
         return listeners
 
     def lastfm_artist_listeners(self, artist_name):
-        """Fetches an artist's total listener count from Last.fm (cached).
-
-        Checked in order: in-memory cache (lifetime of the instance) ->
-        persisted SQLite cache (survives across runs, subject to
-        lastfm_cache_ttl_days) -> live Last.fm request.
-
-        Args:
-            artist_name: Name of the artist.
-
-        Returns:
-            Total listener count as an int, or None if no Last.fm entry was
-            found or the request failed. Results are cached per artist name
-            in self._artist_stats_cache (and persisted to SQLite).
-        """
+        """Return an artist's Last.fm listener count, or None if unavailable."""
+        key = normalize_artist_name(artist_name)
         with self._cache_lock:
-            if artist_name in self._artist_stats_cache:
-                return self._artist_stats_cache[artist_name]
+            cached = self._artist_stats_cache.get(key, _CACHE_MISS)
+        if cached is not _CACHE_MISS:
+            return cached
 
         persisted = self._load_persisted_artist_field(artist_name, "listeners")
         if persisted is not _CACHE_MISS:
             with self._cache_lock:
-                self._artist_stats_cache[artist_name] = persisted
+                self._artist_stats_cache[key] = persisted
             return persisted
 
         data = self._lastfm_get("artist.getInfo", artist=artist_name)
-        assert data is not None
+        if data is self._LASTFM_FAILURE:
+            return None
+
         try:
             listeners = int(data["artist"]["stats"]["listeners"])
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, TypeError, ValueError):
             listeners = None
 
         self._save_persisted_artist_field(artist_name, "listeners", listeners)
         with self._cache_lock:
-            self._artist_stats_cache[artist_name] = listeners
+            self._artist_stats_cache[key] = listeners
         return listeners
 
     def lastfm_artist_top_track_names(self, artist_name):
-        """Fetches the names of an artist's most-listened to tracks (cached).
-
-        Checked in order: in-memory cache (lifetime of the instance) ->
-        persisted SQLite cache (survives across runs, subject to
-        lastfm_cache_ttl_days) -> live Last.fm request. A live fetch always
-        retrieves and persists PERSISTED_TOP_TRACKS_LIMIT names regardless
-        of this instance's artist_top_hit_exclude_n, so the cache stays
-        valid even if a later run uses a different value for it.
-
-        Args:
-            artist_name: Name of the artist.
-
-        Returns:
-            Set of track names (lowercased), limited to
-            self.artist_top_hit_exclude_n entries. Empty set if no data was
-            found or the request failed. Results are cached per artist name
-            in self._top_tracks_cache.
-        """
+        """Return the configured number of an artist's most-played track titles."""
+        key = normalize_artist_name(artist_name)
         with self._cache_lock:
-            if artist_name in self._top_tracks_cache:
-                return self._top_tracks_cache[artist_name]
+            cached = self._top_tracks_cache.get(key)
+        if cached is not None:
+            return set(cached)
 
         persisted = self._load_persisted_artist_field(artist_name, "top_tracks")
-        if persisted is not _CACHE_MISS:
-            names = set(persisted[: self.artist_top_hit_exclude_n])
-            with self._cache_lock:
-                self._top_tracks_cache[artist_name] = names
-            return names
+        if persisted is _CACHE_MISS:
+            data = self._lastfm_get(
+                "artist.getTopTracks", artist=artist_name, limit=self.PERSISTED_TOP_TRACKS_LIMIT,
+            )
+            if data is self._LASTFM_FAILURE:
+                return set()
+            raw = data.get("toptracks", {}).get("track", [])
+            names = [
+                normalize_track_title(track["name"])
+                for track in self._as_list(raw)[:self.PERSISTED_TOP_TRACKS_LIMIT]
+                if isinstance(track, dict) and track.get("name")
+            ]
+            self._save_persisted_artist_field(artist_name, "top_tracks", names)
+        else:
+            names = persisted
 
-        data = self._lastfm_get("artist.getTopTracks", artist=artist_name, limit=self.PERSISTED_TOP_TRACKS_LIMIT)
-        assert data is not None
-        tracks = data.get("toptracks", {}).get("track", [])
-        all_names = [t["name"].lower() for t in tracks if t.get("name")]
-        names = set(all_names[: self.artist_top_hit_exclude_n])
-
-        self._save_persisted_artist_field(artist_name, "top_tracks", all_names)
+        result = set(names[:self.artist_top_hit_exclude_n])
         with self._cache_lock:
-            self._top_tracks_cache[artist_name] = names
-        return names
+            self._top_tracks_cache[key] = set(result)
+        return result
 
     def lastfm_similar_artists(self, artist_name, limit=20):
-        """Fetches Last.fm's collaborative-filtering similar-artist list.
-
-        This is Last.fm's own artist.getSimilar signal - built from
-        listening co-occurrence across Last.fm users, not from tags/genre
-        metadata - used as an independent candidate-discovery and scoring
-        signal (see _ensure_seed_similar_artists) that doesn't depend on
-        an artist having rich genre tagging.
-
-        Checked in order: in-memory cache (lifetime of the instance) ->
-        persisted SQLite cache (survives across runs, subject to
-        lastfm_cache_ttl_days) -> live Last.fm request. A live fetch
-        always retrieves and persists PERSISTED_SIMILAR_LIMIT entries
-        regardless of this call's `limit`, so the cache stays valid across
-        calls/runs that ask for different limits.
-
-        Args:
-            artist_name: Name of the artist.
-            limit: Maximum number of similar artists returned.
-
-        Returns:
-            List of (name, match) tuples, name as returned by Last.fm
-            (not lowercased - callers that need case-insensitive lookups
-            should lower() it themselves) and match a float in [0, 1],
-            ordered by descending match. Empty list if no data was found
-            or the request failed.
-        """
-        cache_key = (artist_name, limit)
+        """Return Last.fm's similar artists as (name, match) pairs."""
+        if limit <= 0:
+            return []
+        key = normalize_artist_name(artist_name)
+        cache_key = (key, limit)
         with self._cache_lock:
             cached = self._similar_artists_cache.get(cache_key)
         if cached is not None:
-            return cached
+            return list(cached)
 
         persisted = self._load_persisted_artist_field(artist_name, "similar")
-        if persisted is not _CACHE_MISS:
-            similar = [tuple(entry) for entry in persisted[:limit]]
-            with self._cache_lock:
-                self._similar_artists_cache[cache_key] = similar
-            return similar
+        if persisted is _CACHE_MISS:
+            data = self._lastfm_get(
+                "artist.getSimilar", artist=artist_name, limit=self.PERSISTED_SIMILAR_LIMIT,
+            )
+            if data is self._LASTFM_FAILURE:
+                return []
+            raw = data.get("similarartists", {}).get("artist", [])
+            similar = []
+            for item in self._as_list(raw)[:self.PERSISTED_SIMILAR_LIMIT]:
+                if not isinstance(item, dict) or not item.get("name"):
+                    continue
+                try:
+                    match = max(0.0, min(1.0, float(item.get("match", 0.0))))
+                except (TypeError, ValueError):
+                    match = 0.0
+                similar.append([item["name"], match])
+            self._save_persisted_artist_field(artist_name, "similar", similar)
+        else:
+            similar = persisted
 
-        data = self._lastfm_get("artist.getSimilar", artist=artist_name, limit=self.PERSISTED_SIMILAR_LIMIT)
-        assert data is not None
-        raw = data.get("similarartists", {}).get("artist", [])
-        all_similar = []
-        for a in raw[: self.PERSISTED_SIMILAR_LIMIT]:
-            name = a.get("name")
-            if not name:
-                continue
-            try:
-                match = float(a.get("match", 0.0))
-            except (TypeError, ValueError):
-                match = 0.0
-            all_similar.append([name, match])
-
-        self._save_persisted_artist_field(artist_name, "similar", all_similar)
-        similar = [tuple(entry) for entry in all_similar[:limit]]
+        result = [tuple(item) for item in similar[:limit]]
         with self._cache_lock:
-            self._similar_artists_cache[cache_key] = similar
-        return similar
+            self._similar_artists_cache[cache_key] = list(result)
+        return result
 
-    def _fetch_artist_info_one(self, artist_name):
-        """Fetches and caches the bundle of Last.fm lookups for one artist.
+    @staticmethod
+    def _init_search_db(cache_path):
+        """Create or migrate the SQLite cache schema."""
+        if cache_path == ":memory:":
+            raise ValueError("cache_path must be a file path because SongRadio uses two SQLite connections")
 
-        Not used by the concurrent batch path anymore (see
-        _fetch_artist_infos_batch, which fetches listeners first and only
-        fetches tags/top_tracks for artists that pass min_artist_listeners,
-        flattened across the whole batch instead of bundled per artist).
-        Kept as a simple, self-contained helper for ad-hoc single-artist
-        lookups outside the batch machinery.
+        db = sqlite3.connect(cache_path, timeout=30)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA busy_timeout=30000")
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS tracks (
+                id TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS queries (
+                query TEXT PRIMARY KEY,
+                offsets_fetched TEXT NOT NULL DEFAULT '[]',
+                exhausted INTEGER NOT NULL DEFAULT 0,
+                last_fetched_at REAL,
+                capped_at_max_offset INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS query_tracks (
+                query TEXT NOT NULL,
+                track_id TEXT NOT NULL,
+                PRIMARY KEY (query, track_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_query_tracks_query ON query_tracks(query);
+            CREATE TABLE IF NOT EXISTS lastfm_artists (
+                artist_name TEXT PRIMARY KEY,
+                display_name TEXT,
+                tags_json TEXT,
+                tags_fetched_at REAL,
+                listeners INTEGER,
+                listeners_fetched_at REAL,
+                top_tracks_json TEXT,
+                top_tracks_fetched_at REAL,
+                similar_json TEXT,
+                similar_fetched_at REAL
+            );
+            CREATE TABLE IF NOT EXISTS lastfm_tracks (
+                artist_name TEXT NOT NULL,
+                track_name TEXT NOT NULL,
+                display_name TEXT,
+                listeners INTEGER,
+                fetched_at REAL,
+                PRIMARY KEY (artist_name, track_name)
+            );
+            CREATE TABLE IF NOT EXISTS streaming_history_artists (
+                artist_name TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                play_count INTEGER NOT NULL,
+                skip_count INTEGER NOT NULL,
+                total_ms_played INTEGER NOT NULL,
+                weighted_score REAL NOT NULL,
+                last_played_ts TEXT,
+                loaded_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS streaming_history_tracks (
+                artist_name TEXT NOT NULL,
+                track_name TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                play_count INTEGER NOT NULL,
+                skip_count INTEGER NOT NULL,
+                total_ms_played INTEGER NOT NULL,
+                weighted_score REAL NOT NULL,
+                last_played_ts TEXT,
+                loaded_at REAL NOT NULL,
+                PRIMARY KEY (artist_name, track_name)
+            );
+            CREATE TABLE IF NOT EXISTS streaming_history_podcasts (
+                show_name TEXT PRIMARY KEY,
+                play_count INTEGER NOT NULL,
+                skip_count INTEGER NOT NULL,
+                total_ms_played INTEGER NOT NULL,
+                weighted_score REAL NOT NULL,
+                last_played_ts TEXT,
+                loaded_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS streaming_history_audiobooks (
+                title TEXT PRIMARY KEY,
+                play_count INTEGER NOT NULL,
+                skip_count INTEGER NOT NULL,
+                total_ms_played INTEGER NOT NULL,
+                weighted_score REAL NOT NULL,
+                last_played_ts TEXT,
+                loaded_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS streaming_history_artist_buckets (
+                artist_name TEXT NOT NULL,
+                slot_label TEXT NOT NULL,
+                weekday_label TEXT NOT NULL,
+                slot_score REAL NOT NULL,
+                weekday_score REAL NOT NULL,
+                joint_score REAL NOT NULL DEFAULT 0,
+                loaded_at REAL NOT NULL,
+                PRIMARY KEY (artist_name, slot_label, weekday_label)
+            );
+        """)
 
-        Args:
-            artist_name: Name of the artist.
-
-        Returns:
-            dict with keys "tags" (set), "listeners" (int or None),
-            "top_tracks" (set).
-        """
-        with self._cache_lock:
-            cached = self._artist_info_cache.get(artist_name)
-        if cached is not None:
-            return cached
-
-        info = {
-            "tags": set(self.lastfm_top_tags(artist_name, limit=20)),
-            "listeners": self.lastfm_artist_listeners(artist_name),
-            "top_tracks": self.lastfm_artist_top_track_names(artist_name),
+        migrations = {
+            "queries": {
+                "capped_at_max_offset": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "lastfm_artists": {
+                "display_name": "TEXT",
+                "similar_json": "TEXT",
+                "similar_fetched_at": "REAL",
+            },
+            "lastfm_tracks": {
+                "display_name": "TEXT",
+            },
+            "streaming_history_artists": {
+                "display_name": "TEXT NOT NULL DEFAULT ''",
+            },
+            "streaming_history_tracks": {
+                "display_name": "TEXT NOT NULL DEFAULT ''",
+            },
+            "streaming_history_artist_buckets": {
+                "joint_score": "REAL NOT NULL DEFAULT 0",
+            },
         }
 
-        with self._cache_lock:
-            self._artist_info_cache[artist_name] = info
-        return info
+        for table, columns in migrations.items():
+            existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+            for column, definition in columns.items():
+                if column not in existing:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
-    def _run_concurrent(self, callables, max_workers):
-        """Runs zero-arg callables on the shared, persistent Last.fm thread pool.
+        db.commit()
+        return db
 
-        Reuses self._lastfm_executor (created once in __init__) instead of
-        spinning up a fresh ThreadPoolExecutor per call, so total OS thread
-        count stays bounded by lastfm_max_workers for the whole run rather
-        than growing with the number of batches. Concurrency below the
-        pool's configured size (e.g. after an adaptive backoff) is achieved
-        by keeping at most max_workers submissions in flight at once, not by
-        resizing the pool.
+    @staticmethod
+    def normalize_title(title):
+        """Return the shared normalized title key used for version matching."""
+        return normalize_track_title(title)
 
-        Uses a sliding window rather than discrete synchronized chunks: as
-        soon as any in-flight callable completes, the next not-yet-submitted
-        one is submitted immediately. A chunk-and-barrier approach (submit
-        max_workers, wait for ALL of them, then submit the next max_workers)
-        would leave up to max_workers-1 threads idle whenever one callable
-        in a chunk runs long, since no new work is handed out until the
-        entire chunk finishes - the sliding window keeps every free slot
-        continuously fed instead.
-
-        Args:
-            callables: List of zero-argument callables to run.
-            max_workers: Maximum number in flight at once for this call.
-
-        Returns:
-            List of concurrent.futures.Future objects, in the same order as
-            `callables`, each already completed.
-        """
-        futures: "list[Future | None]" = [None] * len(callables)
-        pending = {}  # Future -> index into `futures`/`callables`
-        next_idx = 0
-
-        def submit_next():
-            nonlocal next_idx
-            if next_idx < len(callables):
-                fut = self._lastfm_executor.submit(callables[next_idx])
-                pending[fut] = next_idx
-                next_idx += 1
-
-        for _ in range(min(max(1, max_workers), len(callables))):
-            submit_next()
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                futures[pending.pop(future)] = future
-                submit_next()  # immediately refill the slot just freed
-        # Every slot was filled above (one future per input callable) - the
-        # None in the element type only existed to satisfy the initial
-        # placeholder list, not because a slot can stay empty.
-        return cast("list[Future]", futures)
-
-    def close(self):
-        """Shuts down the shared Last.fm thread pool, HTTP session, and the
-        search cache DB.
-
-        Not strictly required for a one-shot script (process exit cleans
-        this up), but good hygiene if an instance is ever reused.
-
-        Args:
-            None.
-
-        Returns:
-            None.
-        """
-        self._lastfm_executor.shutdown(wait=True)
-        self._lastfm_session.close()
-        self._lastfm_db.close()
-        self._search_db.close()
-
-    def _fetch_artist_infos_batch(self, artist_names, max_workers):
-        """Concurrently fetches Last.fm info for a batch of artists.
-
-        Last.fm has no multi-artist "batch" endpoint, so this fires
-        concurrent single-artist requests rather than one at a time.
-        Artists already present in self._artist_info_cache are skipped
-        entirely (no request made, no thread spent).
-
-        Runs in two flattened passes rather than bundling all three
-        per-artist lookups together (see the retired _fetch_artist_info_one):
-
-        1. Listener counts for every not-yet-cached artist, all submitted
-           together as one flat batch of independent tasks.
-        2. Tags + top-tracks, but ONLY for artists whose listener count
-           didn't already fail min_artist_listeners - a candidate that's
-           going to be excluded by the listener floor anyway never needs
-           its tags or top-tracks fetched. This pass is also flattened:
-           2 * len(survivors) independent tasks submitted together, rather
-           than len(survivors) tasks that each make two lookups back to
-           back in a single thread - so the shared executor's concurrency
-           ceiling is spent across artists, not tied up per artist.
-
-        Both passes call _run_concurrent directly from this (non-executor)
-        call site rather than from inside a task already running on
-        self._lastfm_executor - nesting _run_concurrent calls on the same
-        fixed-size executor would risk a deadlock (all worker threads
-        blocked waiting on sub-tasks submitted to that same, fully-occupied
-        pool, with no thread left free to run them).
-
-        Args:
-            artist_names: Iterable of artist names to fetch info for.
-            max_workers: Maximum number of concurrent requests per pass
-                (the caller adapts this between batches based on observed
-                429 rates).
-
-        Returns:
-            dict artist_name -> info dict with keys "tags" (set),
-            "listeners" (int or None), "top_tracks" (set). Artists that
-            fail min_artist_listeners get "tags"/"top_tracks" as empty
-            sets (never fetched) rather than omitted, so downstream
-            filtering doesn't need special-casing for missing keys. Note:
-            this means such artists no longer contribute their real tags
-            to callers that reuse this cache for purposes other than the
-            listener-gated filter cascade (e.g. build_candidate_pool's
-            genre-snowball expansion) - a low-listener artist that would
-            otherwise be a good genre match no longer feeds the snowball.
-        """
-        results = {}
-        to_fetch = []
-        with self._cache_lock:
-            for name in artist_names:
-                cached = self._artist_info_cache.get(name)
-                if cached is not None:
-                    results[name] = cached
-                else:
-                    to_fetch.append(name)
-
-        if not to_fetch:
-            return results
-
-        # Pass 1: listener counts only - the cheapest lookup and the one
-        # with the most exclusionary power.
-        listener_futures = self._run_concurrent(
-            [(lambda n=name: self.lastfm_artist_listeners(n)) for name in to_fetch],
-            max_workers=max_workers,
-        )
-        listeners = {}
-        for name, future in zip(to_fetch, listener_futures):
-            try:
-                listeners[name] = future.result()
-            except Exception as e:
-                logger.warning("Artist listener fetch failed for %s: %s", name, e)
-                listeners[name] = None
-
-        # Same "unknown listeners aren't held against the artist" semantics
-        # as the original listener-floor check in filter_and_rank.
-        survivors = [
-            name for name in to_fetch
-            if listeners[name] is None or listeners[name] >= self.min_artist_listeners
-        ]
-
-        # Pass 2: tags + top-tracks, only for survivors, flattened together.
-        tags, top_tracks = {}, {}
-        if survivors:
-            tag_and_track_futures = self._run_concurrent(
-                [(lambda n=name: set(self.lastfm_top_tags(n, limit=20))) for name in survivors]
-                + [(lambda n=name: self.lastfm_artist_top_track_names(n)) for name in survivors],
-                max_workers=max_workers,
-            )
-            n = len(survivors)
-            for name, future in zip(survivors, tag_and_track_futures[:n]):
-                try:
-                    tags[name] = future.result()
-                except Exception as e:
-                    logger.warning("Artist tags fetch failed for %s: %s", name, e)
-                    tags[name] = set()
-            for name, future in zip(survivors, tag_and_track_futures[n:]):
-                try:
-                    top_tracks[name] = future.result()
-                except Exception as e:
-                    logger.warning("Artist top-tracks fetch failed for %s: %s", name, e)
-                    top_tracks[name] = set()
-
-        for name in to_fetch:
-            info = {
-                "tags": tags.get(name, set()),
-                "listeners": listeners[name],
-                "top_tracks": top_tracks.get(name, set()),
-            }
-            with self._cache_lock:
-                self._artist_info_cache[name] = info
-            results[name] = info
-
-        return results
-
-    @classmethod
-    def _fast_language_hint(cls, text, allowed_languages):
-        """Cheap pre-check for is_allowed_language, before the full model.
-
-        Args:
-            text: Text to check (e.g. a song title).
-            allowed_languages: Set of allowed language codes.
-
-        Returns:
-            True or False for a confident allow/deny decision, or None if
-            the text isn't clear-cut enough - the caller should fall back
-            to the full langdetect model in that case.
-        """
-        letters = sum(1 for c in text if c.isalpha())
-        if letters < 4:
-            return None  # too short to trust any shortcut either way
-
-        non_latin = len(cls._NON_LATIN_SCRIPT_RE.findall(text))
-        if non_latin / letters > 0.5:
-            # Dominated by a non-Latin script - only a confident rejection
-            # if none of the allowed languages could plausibly use it.
-            if not (allowed_languages & cls._NON_LATIN_LANGUAGES):
-                return False
-            return None
-
-        for lang in allowed_languages:
-            pattern = cls._STOPWORD_PATTERNS.get(lang)
-            if pattern and pattern.search(text):
-                return True
-
-        return None
-
-    @lru_cache(maxsize=None)
-    def is_allowed_language(self, text, allowed_languages):
-        """Checks via best-effort language detection whether a text is allowed.
-
-        Tries a few cheap heuristics first (see _fast_language_hint) -
-        script-mismatch rejection and common-word matching - before
-        falling back to the full langdetect model, which profiles
-        character n-grams regardless of how obvious the answer already is
-        and is the actual cost driver here. The heuristics only ever
-        return a confident answer; anything ambiguous still goes through
-        the exact same detect()-based path as before, so accuracy for
-        genuinely uncertain titles is unchanged.
-
-        Args:
-            text: Text to check (e.g. a song title).
-            allowed_languages: Set of allowed language codes (e.g. {"en", "de"}).
-
-        Returns:
-            True if the detected language is contained in allowed_languages
-            or detection fails (a too-short/uncertain text is let through
-            rather than falsely blocked). Otherwise False.
-        """
-        hint = self._fast_language_hint(text, allowed_languages)
-        if hint is not None:
-            return hint
+    @staticmethod
+    def _read_query_state(db, query):
+        """Read a cached Spotify query's pagination state."""
+        row = db.execute(
+            "SELECT offsets_fetched, exhausted, last_fetched_at, capped_at_max_offset "
+            "FROM queries WHERE query = ?",
+            (query,),
+        ).fetchone()
+        if row is None:
+            return {"offsets_fetched": [], "exhausted": False, "last_fetched_at": None, "capped_at_max_offset": False}
+        offsets, exhausted, fetched_at, capped = row
         try:
-            return detect(text) in allowed_languages
-        except LangDetectException:
-            return True  # too short/uncertain -> let it through
+            offsets = json.loads(offsets)
+        except (TypeError, json.JSONDecodeError):
+            offsets = []
+        return {
+            "offsets_fetched": offsets if isinstance(offsets, list) else [],
+            "exhausted": bool(exhausted),
+            "last_fetched_at": fetched_at,
+            "capped_at_max_offset": bool(capped),
+        }
 
-    @classmethod
-    def normalize_title(cls, title):
-        """Normalizes a song title for version-duplicate matching.
+    def _get_query_state(self, query):
+        """Read a cached Spotify query's pagination state."""
+        return self._read_query_state(self._search_db, query)
 
-        Removes remaster/live/radio-edit/feat. suffixes so that different
-        versions of the same song map to the same key.
-
-        Args:
-            title: Raw song title.
-
-        Returns:
-            Normalized title: lowercased, version suffixes removed, only alphanumeric characters and single spaces.
-        """
-        t = title.lower()
-        for pattern in cls.VERSION_SUFFIX_PATTERNS:
-            t = re.sub(pattern, "", t, flags=re.IGNORECASE)
-        return re.sub(r"[^a-z0-9]+", " ", t).strip()
-
-    # --- Streaming history (optional, explicitly invoked) ----------------
-
-    def load_streaming_history(self, stats):
-        """Persists processed Spotify Extended Streaming History stats
-        into the local SQLite cache, so they survive across runs without
-        being reprocessed every time.
-
-        Call this once whenever a *new* history export has been parsed
-        with StreamingHistory.StreamingHistoryParser - not on every
-        SongRadio run. A call always fully replaces whatever streaming-
-        history stats were stored before: a fresh export is always a
-        complete, cumulative history rather than a delta, so there is
-        nothing to merge - the previous snapshot is simply stale once a
-        newer one exists.
-
-        Note: this method only stores the data. It does not currently
-        change candidate gathering or scoring in any way - that's a
-        deliberate next step, not yet built (the planned use is a
-        familiarity-based scoring adjustment, analogous to
-        popularity_bias, that would read these tables).
-
-        Args:
-            stats: A StreamingHistory.StreamingHistoryStats instance, as
-                returned by StreamingHistory.StreamingHistoryParser.parse().
-
-        Returns:
-            None.
-        """
-        now = time.time()
-
-        self._search_db.execute("DELETE FROM streaming_history_artists")
-        self._search_db.execute("DELETE FROM streaming_history_tracks")
-        self._search_db.execute("DELETE FROM streaming_history_podcasts")
-        self._search_db.execute("DELETE FROM streaming_history_audiobooks")
-        self._search_db.execute("DELETE FROM streaming_history_artist_buckets")
-
-        for artist_name, entity in stats.artists.items():
-            self._search_db.execute(
-                "INSERT INTO streaming_history_artists "
-                "(artist_name, play_count, skip_count, total_ms_played, weighted_score, "
-                "last_played_ts, loaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (artist_name, entity.play_count, entity.skip_count, entity.total_ms_played,
-                 entity.weighted_score, entity.last_played_ts, now),
-            )
-        for (artist_name, track_name), entity in stats.tracks.items():
-            self._search_db.execute(
-                "INSERT INTO streaming_history_tracks "
-                "(artist_name, track_name, play_count, skip_count, total_ms_played, "
-                "weighted_score, last_played_ts, loaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (artist_name, track_name, entity.play_count, entity.skip_count,
-                 entity.total_ms_played, entity.weighted_score, entity.last_played_ts, now),
-            )
-        for show_name, entity in stats.podcast_shows.items():
-            self._search_db.execute(
-                "INSERT INTO streaming_history_podcasts "
-                "(show_name, play_count, skip_count, total_ms_played, weighted_score, "
-                "last_played_ts, loaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (show_name, entity.play_count, entity.skip_count, entity.total_ms_played,
-                 entity.weighted_score, entity.last_played_ts, now),
-            )
-        for title, entity in stats.audiobooks.items():
-            self._search_db.execute(
-                "INSERT INTO streaming_history_audiobooks "
-                "(title, play_count, skip_count, total_ms_played, weighted_score, "
-                "last_played_ts, loaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (title, entity.play_count, entity.skip_count, entity.total_ms_played,
-                 entity.weighted_score, entity.last_played_ts, now),
-            )
-        # Persist artist time-buckets for Daylist seed selection.
-        # For each artist/slot/weekday triple we store the slot-aggregated
-        # score and the weekday-aggregated score separately, so Daylist can
-        # weight them independently rather than being forced to use only
-        # the joint (slot, weekday) value.
-        for artist_name, buckets in (stats.artist_time_buckets or {}).items():
-            written_pairs = set()
-            for (slot_label, weekday_label), joint_score in buckets.by_slot_weekday.items():
-                if joint_score <= 0:
-                    continue
-                pair = (slot_label, weekday_label)
-                if pair in written_pairs:
-                    continue
-                written_pairs.add(pair)
-                slot_score = buckets.by_slot.get(slot_label, 0.0)
-                weekday_score = buckets.by_weekday.get(weekday_label, 0.0)
-                self._search_db.execute(
-                    "INSERT INTO streaming_history_artist_buckets "
-                    "(artist_name, slot_label, weekday_label, slot_score, weekday_score, loaded_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(artist_name, slot_label, weekday_label) DO UPDATE SET "
-                    "slot_score=excluded.slot_score, weekday_score=excluded.weekday_score, "
-                    "loaded_at=excluded.loaded_at",
-                    (artist_name, slot_label, weekday_label, slot_score, weekday_score, now),
-                )
-
+    def _save_query_state(self, query, state):
+        """Persist a Spotify query's pagination state."""
+        self._search_db.execute(
+            "INSERT INTO queries (query, offsets_fetched, exhausted, last_fetched_at, capped_at_max_offset) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(query) DO UPDATE SET "
+            "offsets_fetched=excluded.offsets_fetched, exhausted=excluded.exhausted, "
+            "last_fetched_at=excluded.last_fetched_at, capped_at_max_offset=excluded.capped_at_max_offset",
+            (
+                query,
+                json.dumps(state["offsets_fetched"]),
+                int(state["exhausted"]),
+                state["last_fetched_at"],
+                int(state["capped_at_max_offset"]),
+            ),
+        )
         self._search_db.commit()
 
+    def load_streaming_history(self, stats):
+        """Atomically replace persisted streaming-history aggregates."""
+        if not isinstance(stats, StreamingHistoryStats):
+            raise TypeError("stats must be a StreamingHistoryStats instance")
+
+        now = time.time()
+        artist_rows = [
+            (
+                key,
+                stats.artist_display_names.get(key, key),
+                item.play_count,
+                item.skip_count,
+                item.total_ms_played,
+                item.weighted_score,
+                item.last_played_ts,
+                now,
+            )
+            for key, item in stats.artists.items()
+        ]
+        track_rows = [
+            (
+                artist_key,
+                track_key,
+                stats.track_display_names.get((artist_key, track_key), track_key),
+                item.play_count,
+                item.skip_count,
+                item.total_ms_played,
+                item.weighted_score,
+                item.last_played_ts,
+                now,
+            )
+            for (artist_key, track_key), item in stats.tracks.items()
+        ]
+        podcast_rows = [
+            (key, item.play_count, item.skip_count, item.total_ms_played, item.weighted_score, item.last_played_ts, now)
+            for key, item in stats.podcast_shows.items()
+        ]
+        audiobook_rows = [
+            (key, item.play_count, item.skip_count, item.total_ms_played, item.weighted_score, item.last_played_ts, now)
+            for key, item in stats.audiobooks.items()
+        ]
+        bucket_rows = []
+        for artist_key, buckets in (stats.artist_time_buckets or {}).items():
+            for (slot, weekday), joint_score in buckets.by_slot_weekday.items():
+                slot_score = buckets.by_slot.get(slot, 0.0)
+                weekday_score = buckets.by_weekday.get(weekday, 0.0)
+                bucket_rows.append((artist_key, slot, weekday, slot_score, weekday_score, joint_score, now))
+
+        db = self._search_db
+        try:
+            db.execute("BEGIN")
+            for table in (
+                "streaming_history_artists",
+                "streaming_history_tracks",
+                "streaming_history_podcasts",
+                "streaming_history_audiobooks",
+                "streaming_history_artist_buckets",
+            ):
+                db.execute(f"DELETE FROM {table}")
+
+            db.executemany(
+                "INSERT INTO streaming_history_artists "
+                "(artist_name, display_name, play_count, skip_count, total_ms_played, weighted_score, last_played_ts, loaded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                artist_rows,
+            )
+            db.executemany(
+                "INSERT INTO streaming_history_tracks "
+                "(artist_name, track_name, display_name, play_count, skip_count, total_ms_played, weighted_score, last_played_ts, loaded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                track_rows,
+            )
+            db.executemany(
+                "INSERT INTO streaming_history_podcasts "
+                "(show_name, play_count, skip_count, total_ms_played, weighted_score, last_played_ts, loaded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                podcast_rows,
+            )
+            db.executemany(
+                "INSERT INTO streaming_history_audiobooks "
+                "(title, play_count, skip_count, total_ms_played, weighted_score, last_played_ts, loaded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                audiobook_rows,
+            )
+            db.executemany(
+                "INSERT INTO streaming_history_artist_buckets "
+                "(artist_name, slot_label, weekday_label, slot_score, weekday_score, joint_score, loaded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                bucket_rows,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
         logger.info(
-            "Loaded streaming history: %d artist(s), %d track(s), %d podcast show(s), "
-            "%d audiobook(s), %d artist-bucket row(s) (%d record(s) processed, half-life %.0f day(s)).",
-            len(stats.artists), len(stats.tracks), len(stats.podcast_shows), len(stats.audiobooks),
-            len(stats.artist_time_buckets or {}),
-            stats.total_records_processed, stats.half_life_days,
+            "Loaded streaming history: %d artists, %d tracks, %d podcast shows, %d audiobooks.",
+            len(artist_rows), len(track_rows), len(podcast_rows), len(audiobook_rows),
         )
 
-    # --- Pipeline steps ----------------------------------------------
+    def get_familiarity_scores(self):
+        """Return artist familiarity scores keyed by normalized artist name."""
+        rows = self._search_db.execute(
+            "SELECT artist_name, weighted_score FROM streaming_history_artists"
+        ).fetchall()
+        return {artist: score for artist, score in rows}
 
-    def resolve_seed_track_ids(self):
-        """Resolves self.seed_queries into real Spotify track IDs via search.
+    def get_streaming_history_artists(self):
+        """Return stored artists with display names and weighted scores."""
+        return self._search_db.execute(
+            "SELECT artist_name, display_name, weighted_score "
+            "FROM streaming_history_artists ORDER BY weighted_score DESC"
+        ).fetchall()
 
-        Searches Spotify for each (artist, song title) pair and picks the
-        result with the best artist/title match (instead of blindly trusting
-        result #1, since Spotify's field search tends to match fuzzily).
-        Uncertain matches are flagged with a console warning.
+    def get_top_tracks_by_artist(self):
+        """Return each artist's most-played track using original display names."""
+        rows = self._search_db.execute(
+            "SELECT t.artist_name, a.display_name, t.display_name, t.track_name "
+            "FROM streaming_history_tracks AS t "
+            "JOIN streaming_history_artists AS a ON a.artist_name = t.artist_name "
+            "ORDER BY t.artist_name, t.weighted_score DESC"
+        ).fetchall()
+        result = {}
+        for artist_key, artist_display, track_display, track_key in rows:
+            result.setdefault(artist_key, (artist_display or artist_key, track_display or track_key))
+        return result
 
-        Args:
-            None.
+    def get_time_bucket_scores(self, slot, weekday):
+        """Return per-artist slot and weekday scores for the requested context."""
+        rows = self._search_db.execute(
+            "SELECT artist_name, slot_score, weekday_score, joint_score "
+            "FROM streaming_history_artist_buckets "
+            "WHERE slot_label = ? AND weekday_label = ?",
+            (slot, weekday),
+        ).fetchall()
+        return {
+            artist: {"slot_score": slot_score, "weekday_score": weekday_score, "joint_score": joint_score}
+            for artist, slot_score, weekday_score, joint_score in rows
+        }
 
-        Returns:
-            List of Spotify track IDs (str), one per successfully resolved
-            seed. Seeds without a match are skipped.
-        """
-        track_ids = []
-        for artist_name, track_name in self.seed_queries.items():
-            results = self.sp.search(q=f"{track_name} {artist_name}", type="track", limit=10)
-            if not results:
-                print(f"Warning: No match found for '{track_name}' by {artist_name}.")
+    def _get_cached_tracks_for_query(self, query):
+        """Return tracks previously associated with a Spotify search query."""
+        rows = self._search_db.execute(
+            "SELECT t.data FROM query_tracks qt JOIN tracks t ON t.id = qt.track_id WHERE qt.query = ?",
+            (query,),
+        ).fetchall()
+        tracks = []
+        for (data,) in rows:
+            try:
+                track = json.loads(data)
+            except (TypeError, json.JSONDecodeError):
+                logger.warning("Ignoring invalid cached track JSON for query %r.", query)
                 continue
-            items = results.get("tracks", {}).get("items", [])
+            if isinstance(track, dict):
+                tracks.append(track)
+        return tracks
+
+    def _store_track_for_query(self, query, track):
+        """Store a Spotify track and associate it with a search query."""
+        if not isinstance(track, dict) or not track.get("id"):
+            return
+        self._search_db.execute(
+            "INSERT INTO tracks (id, data) VALUES (?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+            (track["id"], json.dumps(track, ensure_ascii=False)),
+        )
+        self._search_db.execute(
+            "INSERT OR IGNORE INTO query_tracks (query, track_id) VALUES (?, ?)",
+            (query, track["id"]),
+        )
+
+    def _is_query_exhausted(self, query):
+        """Return whether Spotify pagination for this query is exhausted or capped."""
+        row = self._search_db.execute(
+            "SELECT exhausted, capped_at_max_offset FROM queries WHERE query = ?",
+            (query,),
+        ).fetchone()
+        return bool(row and (row[0] or row[1]))
+
+    def _paginated_search(self, query, max_results, fresh_ids=None):
+        """Fetch Spotify search pages while reusing cached tracks and pagination state."""
+        if max_results <= 0:
+            return []
+
+        state = self._get_query_state(query)
+        if self.cache_ttl_days and state["last_fetched_at"]:
+            age_days = (time.time() - state["last_fetched_at"]) / 86400
+            if age_days > self.cache_ttl_days:
+                state.update(offsets_fetched=[], exhausted=False, capped_at_max_offset=False)
+
+        collected = self._get_cached_tracks_for_query(query)
+        if state["exhausted"] or len(collected) >= max_results:
+            return collected[:max_results]
+
+        offset = max(state["offsets_fetched"]) + self.search_limit if state["offsets_fetched"] else 0
+        unknown_429_retries = 0
+
+        while offset < max_results and offset <= self._max_offset:
+            try:
+                results = self.sp.search(q=query, type="track", limit=self.search_limit, offset=offset)
+            except spotipy.exceptions.SpotifyException as exc:
+                if getattr(exc, "http_status", None) == 429:
+                    headers = getattr(exc, "headers", None) or {}
+                    raw_retry = headers.get("Retry-After")
+                    try:
+                        retry_after = float(raw_retry) if raw_retry is not None else None
+                    except (TypeError, ValueError):
+                        retry_after = None
+
+                    if retry_after is not None and 0 <= retry_after <= self.RATE_LIMIT_AUTO_RETRY_THRESHOLD:
+                        time.sleep(retry_after + 1)
+                        continue
+                    if retry_after is None and unknown_429_retries < self.MAX_UNKNOWN_429_RETRIES:
+                        unknown_429_retries += 1
+                        delay = self.request_sleep * (2 ** unknown_429_retries)
+                        logger.warning("Spotify returned a 429 without Retry-After; retrying in %.1fs.", delay)
+                        time.sleep(delay)
+                        continue
+
+                    self._save_query_state(query, state)
+                    raise
+
+                logger.exception("Spotify search failed for query %r.", query)
+                self._save_query_state(query, state)
+                break
+            except requests.RequestException:
+                logger.exception("Network error during Spotify search for query %r.", query)
+                self._save_query_state(query, state)
+                break
+
             time.sleep(self.request_sleep)
+            unknown_429_retries = 0
+            items = (results or {}).get("tracks", {}).get("items", [])
+            state["offsets_fetched"].append(offset)
+            state["last_fetched_at"] = time.time()
 
             if not items:
-                print(f"Warning: No track results for '{track_name}' by {artist_name}.")
+                state["exhausted"] = True
+                self._save_query_state(query, state)
+                break
+
+            for track in items:
+                if not isinstance(track, dict) or not track.get("id"):
+                    continue
+                self._store_track_for_query(query, track)
+                collected.append(track)
+                if fresh_ids is not None:
+                    fresh_ids.add(track["id"])
+
+            self._save_query_state(query, state)
+            offset += self.search_limit
+
+        if not state["exhausted"] and offset > self._max_offset:
+            state["capped_at_max_offset"] = True
+            self._save_query_state(query, state)
+
+        return collected[:max_results]
+
+    @staticmethod
+    def _track_artist_names(track):
+        """Return nonempty artist names from a Spotify track object."""
+        artists = track.get("artists") if isinstance(track, dict) else None
+        if not isinstance(artists, list):
+            return []
+        return [artist["name"] for artist in artists if isinstance(artist, dict) and artist.get("name")]
+
+    def resolve_seed_track_ids(self):
+        """Resolve configured seed artist/title pairs to Spotify track IDs."""
+        track_ids = []
+        for artist_name, track_name in self.seed_queries.items():
+            if not isinstance(artist_name, str) or not isinstance(track_name, str):
+                logger.warning("Skipping invalid seed entry: %r -> %r.", artist_name, track_name)
                 continue
 
-            def match_score(item):
-                item_artist = item["artists"][0]["name"].lower()
-                artist_ok = artist_name.lower() in item_artist or item_artist in artist_name.lower()
-                title_sim = difflib.SequenceMatcher(None, item["name"].lower(), track_name.lower()).ratio()
-                return (artist_ok, title_sim)
+            response = self.sp.search(q=f"{track_name} {artist_name}", type="track", limit=10)
+            time.sleep(self.request_sleep)
+            items = (response or {}).get("tracks", {}).get("items", [])
+            items = [item for item in items if isinstance(item, dict) and item.get("id")]
+            if not items:
+                logger.warning("No Spotify track results for %r by %r.", track_name, artist_name)
+                continue
 
-            best = max(items, key=match_score)
-            artist_ok, title_sim = match_score(best)
-            if not artist_ok or title_sim < 0.6:
-                print(f"Warning: uncertain match for '{track_name}' -> '{best['name']}' ({title_sim:.2f}).")
+            expected_artist = normalize_artist_name(artist_name)
+            expected_title = normalize_track_title(track_name)
 
+            def score(item):
+                names = [normalize_artist_name(name) for name in self._track_artist_names(item)]
+                artist_match = any(
+                    expected_artist == name or expected_artist in name or name in expected_artist
+                    for name in names if expected_artist and name
+                )
+                title = normalize_track_title(item.get("name", ""))
+                title_match = difflib.SequenceMatcher(None, expected_title, title).ratio()
+                return artist_match, title_match
+
+            best = max(items, key=score)
+            artist_match, title_match = score(best)
+            if not artist_match or title_match < 0.6:
+                logger.warning(
+                    "Uncertain seed match for %r by %r: Spotify returned %r (title similarity %.2f).",
+                    track_name, artist_name, best.get("name"), title_match,
+                )
             track_ids.append(best["id"])
-            print(f"  Found: {best['name']} by {best['artists'][0]['name']} ({best['id']})")
+            logger.info("Resolved seed %r by %r to Spotify track %s.", track_name, artist_name, best["id"])
         return track_ids
 
     def get_seed_artist_ids_and_genres(self, seed_track_ids):
-        """Fetches artist data and genres for the seed tracks.
-
-        Loads each seed track individually (populating self.seed_tracks and
-        self.seed_artist_names) and determines genres primarily via Last.fm
-        (artist.getTopTags), since Spotify's own "genres" field on artist
-        objects is frequently empty. Only if Last.fm returns no tags does it
-        fall back to Spotify's artist.genres. Also stores the resulting genre
-        set as self.seed_genre_set for later genre-similarity ranking in
-        filter_and_rank.
-
-        Args:
-            seed_track_ids: List of Spotify track IDs of the seed tracks.
-
-        Returns:
-            Tuple of:
-                - List of Spotify artist IDs (str), one per seed track.
-                - Counter mapping genre tag -> frequency across all seed artists.
-        """
+        """Load seed tracks, artist names, and their Last.fm genre tags."""
+        self.seed_tracks = []
+        self.seed_artist_names = []
+        self.seed_genre_set = set()
         artist_ids = []
+
         for track_id in seed_track_ids:
             track = self.sp.track(track_id)
-            assert track is not None, f"track {track_id} could not be resolved from its ID"
+            if not isinstance(track, dict):
+                logger.warning("Spotify did not return seed track %s.", track_id)
+                continue
+            artists = self._track_artist_names(track)
+            artist_objects = track.get("artists", [])
+            if not artists or not artist_objects or not artist_objects[0].get("id"):
+                logger.warning("Seed track %s has no usable primary artist.", track_id)
+                continue
             self.seed_tracks.append(track)
-            artist_ids.append(track["artists"][0]["id"])
-            self.seed_artist_names.append(track["artists"][0]["name"])
+            self.seed_artist_names.append(artists[0])
+            artist_ids.append(artist_objects[0]["id"])
             time.sleep(self.request_sleep)
 
         genre_counter = Counter()
         for artist_name in self.seed_artist_names:
-            # limit=8 (default) leaves too few tags after blocklist filtering
-            # for genre_pool_multiplier to have anything meaningful to sample
-            # from. Fetch more raw tags instead.
             genre_counter.update(self.lastfm_top_tags(artist_name, limit=20))
             time.sleep(self.request_sleep)
 
         if not genre_counter:
             for artist_id in artist_ids:
                 artist = self.sp.artist(artist_id)
-                assert artist is not None, f"artist {artist_id} could not be resolved from its ID"
-                genre_counter.update(artist.get("genres", []))
+                if isinstance(artist, dict):
+                    genre_counter.update(
+                        str(genre).casefold()
+                        for genre in artist.get("genres", [])
+                        if isinstance(genre, str)
+                    )
                 time.sleep(self.request_sleep)
 
         self.seed_genre_set = set(genre_counter)
         return artist_ids, genre_counter
 
     def _ensure_seed_similar_artists(self):
-        """Fetches Last.fm's similar-artist lists for the seed artists, once.
-
-        Populates two pieces of state used by build_candidate_pool and
-        filter_and_rank:
-          - self._similar_artist_pool_names: deduped list of similar-artist
-            names, used as a third candidate-search source in
-            build_candidate_pool (alongside genre search and the seed
-            artists' own catalogs) - searching Spotify for tracks by
-            artists Last.fm's community associates with the seed(s), a
-            signal independent of genre/tag data.
-          - self.seed_similar_match: lowercased artist name -> highest
-            Last.fm match score across all seed artists' similar-lists,
-            used in filter_and_rank to blend into the tag-based similarity
-            score (see similarity_blend_weight_range).
-
-        Idempotent (checks self._similar_artist_pool_names is not None) so
-        it's safe to call at the top of build_candidate_pool every time
-        without redoing the work if called more than once on the same
-        instance.
-
-        Cost: exactly one Last.fm request per seed artist (cached like
-        every other Last.fm lookup here - a repeat run or overlapping
-        seeds costs nothing extra), regardless of
-        lastfm_similar_artist_count/thin_tag_similar_artist_count, since
-        those only affect how much of the single cached response is used.
-
-        If the seeds' own Last.fm tags are thin after blocklist filtering
-        (fewer than thin_tag_genre_threshold - the same situation that
-        leaves genre search and its snowball expansion with structurally
-        little to work with, e.g. a regional/dialect act with sparse
-        tagging), thin_tag_similar_artist_count is used instead of
-        lastfm_similar_artist_count, leaning candidate discovery more
-        heavily on this collaborative signal precisely where the
-        tag-based one is weakest.
-
-        Args:
-            None.
-
-        Returns:
-            None.
-        """
+        """Load first-hop and bounded second-hop Last.fm similar artists."""
         if self._similar_artist_pool_names is not None:
             return
 
-        blocklist = self.LASTFM_JUNK_TAGS | self.excluded_genres
-        usable_seed_tags = {g for g in self.seed_genre_set if g not in blocklist}
-        thin_tags = len(usable_seed_tags) < self.thin_tag_genre_threshold
+        usable_tags = self.seed_genre_set - self.LASTFM_JUNK_TAGS - self.excluded_genres
+        thin_tags = len(usable_tags) < self.thin_tag_genre_threshold
         count = self.thin_tag_similar_artist_count if thin_tags else self.lastfm_similar_artist_count
 
-        pool_names = []
-        seen_lower = set()
+        first_hop = []
+        first_hop_seen = set()
         match_by_artist = {}
+        seed_keys = {normalize_artist_name(name) for name in self.seed_artist_names}
+
         for seed_artist in self.seed_artist_names:
             for name, match in self.lastfm_similar_artists(seed_artist, limit=count):
-                name_lower = name.lower()
-                if name_lower not in match_by_artist or match > match_by_artist[name_lower]:
-                    match_by_artist[name_lower] = match
-                if name_lower not in seen_lower and name_lower not in self.excluded_artists:
-                    seen_lower.add(name_lower)
-                    pool_names.append(name)
+                key = normalize_artist_name(name)
+                if not key:
+                    continue
+                match_by_artist[key] = max(match_by_artist.get(key, 0.0), match)
+                if key not in first_hop_seen and key not in seed_keys and key not in self.excluded_artists:
+                    first_hop_seen.add(key)
+                    first_hop.append(name)
             time.sleep(self.request_sleep)
 
-        self._similar_artist_pool_names = pool_names
+        second_hop = []
+        second_hop_seen = set(first_hop_seen | seed_keys)
+        remaining_budget = self.max_2hop_artists
+
+        for parent in first_hop:
+            if remaining_budget <= 0:
+                break
+            for name, match in self.lastfm_similar_artists(parent, limit=min(count, remaining_budget)):
+                key = normalize_artist_name(name)
+                if not key:
+                    continue
+                match_by_artist[key] = max(match_by_artist.get(key, 0.0), match)
+                if key in second_hop_seen or key in self.excluded_artists:
+                    continue
+                second_hop_seen.add(key)
+                second_hop.append(name)
+                remaining_budget -= 1
+                if remaining_budget <= 0:
+                    break
+            time.sleep(self.request_sleep)
+
+        self._similar_artist_pool_names = first_hop
+        self._two_hop_artist_pool_names = second_hop
         self.seed_similar_match = match_by_artist
+
         if thin_tags:
-            print(
-                f"Thin tag coverage for seed(s) ({len(usable_seed_tags)} usable tag(s)) - "
-                f"leaning on Last.fm similar-artist discovery ({count} per seed, "
-                f"{len(pool_names)} unique artists) instead of genre search."
+            logger.info(
+                "Seed tags are sparse; using %d first-hop and %d second-hop similar artists.",
+                len(first_hop), len(second_hop),
             )
 
-    @staticmethod
-    def _init_search_db(cache_path):
-        """Opens (creating if needed) the SQLite search-cache database.
+    def _is_allowed_artist(self, artist_name):
+        """Return whether an artist is absent from the configured exclusion list."""
+        return normalize_artist_name(artist_name) not in self.excluded_artists
 
-        Schema: "tracks" (id -> JSON-encoded track object), "queries" (one
-        row per Spotify query with its exploration state), and
-        "query_tracks" (which tracks were found by which query, so a track
-        discovered by multiple queries is still only stored once). Every
-        write elsewhere in this class targets exactly the row(s) that
-        changed - a single new track or a single query's progress update -
-        rather than re-serializing the whole cache, which is what made the
-        previous JSON-based format's cost scale with total accumulated
-        history instead of with the current run's actual work.
+    def _run_concurrent(self, callables, max_workers):
+        """Run callables with a bounded number of tasks in flight."""
+        if not callables:
+            return []
 
-        Also creates the persisted Last.fm cache tables in the same file:
-        "lastfm_artists" (one row per artist, with separate value/fetched_at
-        column pairs for tags/listeners/top_tracks, so any subset of the
-        three can be populated or refreshed independently of the others)
-        and "lastfm_tracks" (per (artist, track) listener counts). These are
-        read and written through a SEPARATE connection (self._lastfm_db,
-        opened in __init__ with check_same_thread=False), since Last.fm
-        lookups run concurrently from the executor's worker threads unlike
-        everything else in this method, which stays main-thread-only.
+        limit = min(len(callables), max(1, max_workers), self.lastfm_max_workers)
+        futures = [None] * len(callables)
+        pending = {}
+        next_index = 0
 
-        WAL journal mode is used so commits are fast and don't block reads
-        from a concurrent process (e.g. inspecting the cache while a run is
-        in progress). This connection (the one returned here) is only ever
-        used from the main thread - Spotify search/caching isn't
-        parallelized - so no locking around it is needed.
+        def submit_next():
+            nonlocal next_index
+            if next_index < len(callables):
+                future = self._lastfm_executor.submit(callables[next_index])
+                pending[future] = next_index
+                next_index += 1
 
-        Args:
-            cache_path: Path to the SQLite database file.
+        for _ in range(limit):
+            submit_next()
 
-        Returns:
-            sqlite3.Connection.
-        """
-        db = sqlite3.connect(cache_path)
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("CREATE TABLE IF NOT EXISTS tracks (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS queries ("
-            "query TEXT PRIMARY KEY, offsets_fetched TEXT NOT NULL DEFAULT '[]', "
-            "exhausted INTEGER NOT NULL DEFAULT 0, last_fetched_at REAL, "
-            "capped_at_max_offset INTEGER NOT NULL DEFAULT 0)"
-        )
-        # Migration for databases created before capped_at_max_offset
-        # existed (see _paginated_search: a query that hits _max_offset
-        # without Spotify ever returning an empty page was previously
-        # indistinguishable from a genuinely productive, not-yet-exhausted
-        # query - this column lets _is_query_exhausted recognize it as a
-        # dead end too, distinct from true exhaustion).
-        existing_query_cols = {row[1] for row in db.execute("PRAGMA table_info(queries)").fetchall()}
-        if "capped_at_max_offset" not in existing_query_cols:
-            db.execute("ALTER TABLE queries ADD COLUMN capped_at_max_offset INTEGER NOT NULL DEFAULT 0")
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS query_tracks ("
-            "query TEXT NOT NULL, track_id TEXT NOT NULL, PRIMARY KEY (query, track_id))"
-        )
-        db.execute("CREATE INDEX IF NOT EXISTS idx_query_tracks_query ON query_tracks(query)")
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS lastfm_artists ("
-            "artist_name TEXT PRIMARY KEY, "
-            "tags_json TEXT, tags_fetched_at REAL, "
-            "listeners INTEGER, listeners_fetched_at REAL, "
-            "top_tracks_json TEXT, top_tracks_fetched_at REAL)"
-        )
-        # Migration for databases created before similar_json/
-        # similar_fetched_at existed: CREATE TABLE IF NOT EXISTS is a
-        # no-op on an already-existing table, so an older lastfm_artists
-        # table needs these two columns added explicitly, or every
-        # lastfm_similar_artists lookup against an existing cache file
-        # would fail with "no such column". ADD COLUMN defaults new rows'
-        # existing entries to NULL, which _load_persisted_artist_field
-        # already treats as "never fetched" - exactly the desired
-        # behavior for data that predates this feature.
-        existing_cols = {row[1] for row in db.execute("PRAGMA table_info(lastfm_artists)").fetchall()}
-        if "similar_json" not in existing_cols:
-            db.execute("ALTER TABLE lastfm_artists ADD COLUMN similar_json TEXT")
-        if "similar_fetched_at" not in existing_cols:
-            db.execute("ALTER TABLE lastfm_artists ADD COLUMN similar_fetched_at REAL")
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS lastfm_tracks ("
-            "artist_name TEXT NOT NULL, track_name TEXT NOT NULL, "
-            "listeners INTEGER, fetched_at REAL, "
-            "PRIMARY KEY (artist_name, track_name))"
-        )
-        # Persisted output of StreamingHistory.StreamingHistoryParser (see
-        # load_streaming_history) - a user's own Spotify listening
-        # history, parsed once and reused across runs rather than
-        # reprocessed every time. Written to from the main thread only
-        # (load_streaming_history is an explicit, occasional call, not
-        # something invoked from the Last.fm executor's worker threads),
-        # so this connection is fine for it, same as the query-cache
-        # tables above.
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS streaming_history_artists ("
-            "artist_name TEXT PRIMARY KEY, play_count INTEGER NOT NULL, "
-            "skip_count INTEGER NOT NULL, total_ms_played INTEGER NOT NULL, "
-            "weighted_score REAL NOT NULL, last_played_ts TEXT, loaded_at REAL NOT NULL)"
-        )
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS streaming_history_tracks ("
-            "artist_name TEXT NOT NULL, track_name TEXT NOT NULL, "
-            "play_count INTEGER NOT NULL, skip_count INTEGER NOT NULL, "
-            "total_ms_played INTEGER NOT NULL, weighted_score REAL NOT NULL, "
-            "last_played_ts TEXT, loaded_at REAL NOT NULL, "
-            "PRIMARY KEY (artist_name, track_name))"
-        )
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS streaming_history_podcasts ("
-            "show_name TEXT PRIMARY KEY, play_count INTEGER NOT NULL, "
-            "skip_count INTEGER NOT NULL, total_ms_played INTEGER NOT NULL, "
-            "weighted_score REAL NOT NULL, last_played_ts TEXT, loaded_at REAL NOT NULL)"
-        )
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS streaming_history_audiobooks ("
-            "title TEXT PRIMARY KEY, play_count INTEGER NOT NULL, "
-            "skip_count INTEGER NOT NULL, total_ms_played INTEGER NOT NULL, "
-            "weighted_score REAL NOT NULL, last_played_ts TEXT, loaded_at REAL NOT NULL)"
-        )
-        # Per-artist time-bucket scores for Daylist seed selection.
-        # One row per (artist_name, slot_label, weekday_label) triple -
-        # stores the aggregated slot_score and weekday_score from
-        # StreamingHistoryStats.artist_time_buckets so Daylist can ask
-        # "what artists do I play on Friday evenings?" without re-scanning
-        # every individual track. Only populated when load_streaming_history
-        # is called with a StreamingHistoryStats that has artist_time_buckets
-        # populated (i.e. parsed with StreamingHistoryParser).
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS streaming_history_artist_buckets ("
-            "artist_name TEXT NOT NULL, slot_label TEXT NOT NULL, weekday_label TEXT NOT NULL, "
-            "slot_score REAL NOT NULL, weekday_score REAL NOT NULL, loaded_at REAL NOT NULL, "
-            "PRIMARY KEY (artist_name, slot_label, weekday_label))"
-        )
-        db.commit()
-        return db
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                index = pending.pop(future)
+                futures[index] = future
+                submit_next()
 
-    def _get_query_state(self, query):
-        """Reads a query's exploration state from the cache.
+        return cast(list[Future], futures)
 
-        Args:
-            query: Spotify search query string.
+    def _fetch_artist_infos_batch(self, artist_names, max_workers):
+        """Fetch listeners first, then fetch tags and top tracks for eligible artists."""
+        names = list(dict.fromkeys(name for name in artist_names if isinstance(name, str) and name.strip()))
+        results = {}
+        missing = []
 
-        Returns:
-            dict with "offsets_fetched" (list[int]), "exhausted" (bool),
-            "last_fetched_at" (float or None), "capped_at_max_offset"
-            (bool - True if a previous call had to stop at _max_offset
-            without Spotify ever returning an empty page, i.e. a dead end
-            distinct from true exhaustion but just as unproductive to
-            retry - see _paginated_search). A fresh/default state is
-            returned if the query has never been cached.
-        """
-        row = self._search_db.execute(
-            "SELECT offsets_fetched, exhausted, last_fetched_at, capped_at_max_offset FROM queries WHERE query = ?",
-            (query,),
-        ).fetchone()
-        if row is None:
-            return {
-                "offsets_fetched": [], "exhausted": False, "last_fetched_at": None,
-                "capped_at_max_offset": False,
-            }
-        offsets_fetched, exhausted, last_fetched_at, capped_at_max_offset = row
-        return {
-            "offsets_fetched": json.loads(offsets_fetched),
-            "exhausted": bool(exhausted),
-            "last_fetched_at": last_fetched_at,
-            "capped_at_max_offset": bool(capped_at_max_offset),
-        }
-
-    def _save_query_state(self, query, state):
-        """Upserts a single query's exploration state.
-
-        A single-row write regardless of how many other queries or tracks
-        have ever been cached - this is what replaces the old
-        "re-serialize the entire cache" save.
-
-        Args:
-            query: Spotify search query string.
-            state: dict as returned by _get_query_state.
-
-        Returns:
-            None.
-        """
-        self._search_db.execute(
-            "INSERT INTO queries (query, offsets_fetched, exhausted, last_fetched_at, capped_at_max_offset) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(query) DO UPDATE SET "
-            "offsets_fetched=excluded.offsets_fetched, exhausted=excluded.exhausted, "
-            "last_fetched_at=excluded.last_fetched_at, capped_at_max_offset=excluded.capped_at_max_offset",
-            (
-                query, json.dumps(state["offsets_fetched"]), int(state["exhausted"]), state["last_fetched_at"],
-                int(state["capped_at_max_offset"]),
-            ),
-        )
-        self._search_db.commit()
-
-    def _get_cached_tracks_for_query(self, query):
-        """Fetches the track objects already known to belong to a query.
-
-        Args:
-            query: Spotify search query string.
-
-        Returns:
-            List of track objects (dicts), in no particular order.
-        """
-        rows = self._search_db.execute(
-            "SELECT t.data FROM query_tracks qt JOIN tracks t ON t.id = qt.track_id WHERE qt.query = ?", (query,)
-        ).fetchall()
-        return [json.loads(data) for (data,) in rows]
-
-    def _store_track_for_query(self, query, track):
-        """Upserts one track and links it to a query, in a single transaction.
-
-        Args:
-            query: Spotify search query string this track was found under.
-            track: Spotify track object (dict); must have an "id".
-
-        Returns:
-            None.
-        """
-        self._search_db.execute(
-            "INSERT INTO tracks (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
-            (track["id"], json.dumps(track)),
-        )
-        self._search_db.execute(
-            "INSERT OR IGNORE INTO query_tracks (query, track_id) VALUES (?, ?)", (query, track["id"]),
-        )
-
-    def _is_query_exhausted(self, query):
-        """Checks whether a query is already known to be a dead end.
-
-        True for two distinct but practically equivalent reasons: Spotify
-        confirmed there are genuinely no more results at any offset
-        (exhausted), or a previous call had to stop at _max_offset without
-        Spotify ever returning an empty page (capped_at_max_offset) -
-        Spotify may still have more results beyond that point, but this
-        codebase's own safety ceiling means _paginated_search can never
-        reach them regardless of how high max_results is set. Either way,
-        callers choosing which genre/artist to try next (see
-        genre_query_exhausted in build_candidate_pool) should treat this
-        query as unproductive to re-select.
-
-        Args:
-            query: Spotify search query string.
-
-        Returns:
-            bool.
-        """
-        row = self._search_db.execute(
-            "SELECT exhausted, capped_at_max_offset FROM queries WHERE query = ?", (query,)
-        ).fetchone()
-        return bool(row and (row[0] or row[1]))
-
-    def _paginated_search(self, query, max_results, fresh_ids=None):
-        """Pages through Spotify search results via offset.
-
-        Increases offset in steps of self.search_limit until either
-        max_results is reached or Spotify returns an empty results page (end
-        of the filtered database). Handles 429 responses: short wait times
-        (<= RATE_LIMIT_AUTO_RETRY_THRESHOLD seconds) are waited out and the
-        offset retried. A 429 with no usable Retry-After header is retried a
-        small, bounded number of times (MAX_UNKNOWN_429_RETRIES) with a
-        short exponential backoff first - spotipy is known to mislabel a
-        transient run of 5xx responses (e.g. a brief Spotify-side 502 burst)
-        as an unknown-wait 429, and that case usually clears within one or
-        two quick retries. Only once that retry budget is exhausted does it
-        abort (raise), so the lockout isn't extended by further requests.
-
-        Reuses previously cached results for this exact query (see
-        self._search_db) instead of re-fetching them, and only issues live
-        Spotify requests for offsets not yet visited by any prior run. If the
-        cached entry is older than self.cache_ttl_days, its exploration state
-        (offsets_fetched/exhausted) is reset so it gets re-scanned from
-        offset 0 - this catches drift in Spotify's ranking over time, at the
-        cost of re-fetching the top results once. Previously found tracks are
-        never discarded. Both the query's exploration state and any newly
-        found tracks are committed to the SQLite cache after every fetched
-        page (see _save_query_state/_store_track_for_query), and also on
-        terminal events (an error, a 429 abort) before this function exits
-        early - each such write only touches the row(s) that changed, so
-        doing this every page costs the same regardless of how large the
-        cache has grown overall.
-
-        Args:
-            query: Spotify search query (e.g. 'genre:"funk rock"').
-            max_results: Upper bound on results collected for this query
-                (cached + newly fetched).
-            fresh_ids: Optional set that track IDs get added to when they're
-                obtained via a live Spotify request in this call, as opposed
-                to being replayed from the cache's existing track_ids. Lets
-                a caller measure what fraction of a candidate pool came from
-                genuinely new requests this run (see build_candidate_pool).
-
-        Returns:
-            List of Spotify track objects (dicts).
-
-        Raises:
-            spotipy.exceptions.SpotifyException: On a 429 with a long/unknown
-                wait time, or when spotipy re-raises the exception (via `raise`).
-        """
-        state = self._get_query_state(query)
-
-        if self.cache_ttl_days and state["last_fetched_at"]:
-            age_days = (time.time() - state["last_fetched_at"]) / 86400
-            if age_days > self.cache_ttl_days:
-                state["offsets_fetched"] = []
-                state["exhausted"] = False
-                state["capped_at_max_offset"] = False
-
-        collected = self._get_cached_tracks_for_query(query)
-
-        if state["exhausted"] or len(collected) >= max_results:
-            return collected
-
-        offset = (max(state["offsets_fetched"]) + self.search_limit) if state["offsets_fetched"] else 0
-        unknown_429_retries = 0
-        while offset < max_results and offset <= self._max_offset:
-            try:
-                results = self.sp.search(q=query, type="track", limit=self.search_limit, offset=offset)
-            except spotipy.exceptions.SpotifyException as e:
-                # Check for 429 rate limit
-                if getattr(e, "http_status", None) == 429:
-                    # Safe access to the header, in case headers is None
-                    headers = getattr(e, "headers", {}) or {}
-                    raw_retry = headers.get("Retry-After")
-                    retry_after = None
-                    if raw_retry is not None:
-                        try:
-                            retry_after = int(raw_retry)
-                        except ValueError:
-                            print(f"Spotify sent an HTTP date instead of seconds: {raw_retry}")
-                            pass  # stays None, aborted below
-                    if retry_after is not None and retry_after <= self.RATE_LIMIT_AUTO_RETRY_THRESHOLD:
-                        print(f"Short rate limit ({retry_after}s) - waiting and retrying...")
-                        time.sleep(retry_after + 1)
-                        continue
-                    if retry_after is None and unknown_429_retries < self.MAX_UNKNOWN_429_RETRIES:
-                        # No usable Retry-After at all (as opposed to a
-                        # long/known one) is what spotipy also reports for a
-                        # transient run of 5xx errors it gave up retrying
-                        # internally - not necessarily a genuine, sustained
-                        # rate limit. Give it a couple of short chances to
-                        # clear before treating it as the real thing.
-                        unknown_429_retries += 1
-                        wait_s = self.request_sleep * (2 ** unknown_429_retries)
-                        print(
-                            f"429 with no Retry-After (possibly a transient 5xx burst, not a real "
-                            f"rate limit) - short retry {unknown_429_retries}/{self.MAX_UNKNOWN_429_RETRIES} "
-                            f"in {wait_s:.1f}s..."
-                        )
-                        time.sleep(wait_s)
-                        continue
-                    wait_msg = f"{retry_after}s" if retry_after is not None else f"unknown ({raw_retry})"
-                    print(f"Rate limit reached (wait time: {wait_msg}) - aborting completely.")
-                    self._save_query_state(query, state)  # persist progress made so far before hard-aborting
-                    raise  # hard-stops the script so it doesn't proceed as if it "succeeded"
+        with self._cache_lock:
+            for name in names:
+                key = normalize_artist_name(name)
+                cached = self._artist_info_cache.get(key)
+                if cached is None:
+                    missing.append((key, name))
                 else:
-                    # A DIFFERENT Spotify error occurred (e.g. 500, 400, 401)
-                    print(f"Unexpected API error for query '{query}': {e}")
-                    self._save_query_state(query, state)  # persist progress before abandoning this query
-                    break  # skips THIS search, but continues with the next artist
-            except Exception as e:
-                # Catches general network timeouts (requests.exceptions.ReadTimeout)
-                print(f"Network or system error: {e}")
-                self._save_query_state(query, state)  # persist progress before abandoning this query
-                break
-            time.sleep(self.request_sleep)
-            unknown_429_retries = 0  # this offset succeeded - a later burst gets its own fresh budget
-            assert results is not None
-            items = results.get("tracks", {}).get("items", [])
-            state["offsets_fetched"].append(offset)
-            state["last_fetched_at"] = time.time()
-            if not items:
-                state["exhausted"] = True
-                self._save_query_state(query, state)
-                break  # reached the end of the filtered database
-            for track in items:
-                if track and track.get("id"):
-                    self._store_track_for_query(query, track)
-                    collected.append(track)
-                    if fresh_ids is not None:
-                        fresh_ids.add(track["id"])  # obtained via a live request, not the cache replay above
-            # Each write here is scoped to exactly this page's rows (see
-            # _store_track_for_query/_save_query_state) rather than
-            # re-serializing the whole cache, so there's no cost trade-off
-            # in doing this every page - unlike the old JSON format, this
-            # doesn't need debouncing to stay cheap. _save_query_state's
-            # commit below covers both the track rows just inserted and
-            # this query's updated state, atomically, in one transaction.
-            self._save_query_state(query, state)
-            offset += self.search_limit
-        # The loop can exit two ways without ever setting state["exhausted"]:
-        # its condition was false from the start (offset already past
-        # _max_offset from a previous call), or it ran and then walked
-        # offset past _max_offset without Spotify ever returning an empty
-        # page. Either way, this query is now a dead end for
-        # _paginated_search - no future max_results, however large, can
-        # ever produce another live fetch for it, since the loop condition
-        # itself blocks entry. Recording that distinctly (rather than
-        # leaving it indistinguishable from a genuinely still-productive
-        # query) is what lets _is_query_exhausted correctly deprioritize
-        # it instead of genre/artist selection wastefully re-picking it.
-        if not state["exhausted"] and offset > self._max_offset:
-            state["capped_at_max_offset"] = True
-            self._save_query_state(query, state)
-        return collected
+                    results[name] = cached
+
+        if not missing:
+            return results
+
+        listener_futures = self._run_concurrent(
+            [lambda name=name: self.lastfm_artist_listeners(name) for _, name in missing],
+            max_workers,
+        )
+        listeners = {}
+        for (key, name), future in zip(missing, listener_futures):
+            try:
+                listeners[key] = future.result()
+            except Exception:
+                logger.exception("Failed to fetch Last.fm listener count for %s.", name)
+                listeners[key] = None
+
+        survivors = [
+            (key, name) for key, name in missing
+            if listeners[key] is None or listeners[key] >= self.min_artist_listeners
+        ]
+        tasks = (
+            [("tags", key, name) for key, name in survivors]
+            + [("top_tracks", key, name) for key, name in survivors]
+        )
+        futures = self._run_concurrent(
+            [
+                (lambda kind=kind, name=name: self.lastfm_top_tags(name, limit=20))
+                if kind == "tags"
+                else (lambda name=name: self.lastfm_artist_top_track_names(name))
+                for kind, _key, name in tasks
+            ],
+            max_workers,
+        )
+
+        fetched = {}
+        for (kind, key, _name), future in zip(tasks, futures):
+            try:
+                value = future.result()
+            except Exception:
+                logger.exception("Failed to fetch Last.fm %s for %s.", kind, _name)
+                value = [] if kind == "tags" else set()
+            fetched.setdefault(key, {})[kind] = value
+
+        for key, name in missing:
+            data = fetched.get(key, {})
+            info = {
+                "tags": set(data.get("tags", [])),
+                "listeners": listeners[key],
+                "top_tracks": set(data.get("top_tracks", set())),
+            }
+            with self._cache_lock:
+                self._artist_info_cache[key] = info
+            results[name] = info
+
+        return results
+
+    @classmethod
+    def _fast_language_hint(cls, text, allowed_languages):
+        """Return a confident language decision, or None when detection is needed."""
+        letters = sum(char.isalpha() for char in text)
+        if letters < 4:
+            return None
+
+        non_latin = len(cls._NON_LATIN_SCRIPT_RE.findall(text))
+        if non_latin / letters > 0.5:
+            if not allowed_languages.intersection(cls._NON_LATIN_LANGUAGES):
+                return False
+            return None
+
+        for language in allowed_languages:
+            pattern = cls._STOPWORD_PATTERNS.get(language)
+            if pattern and pattern.search(text):
+                return True
+        return None
+
+    @lru_cache(maxsize=20_000)
+    def is_allowed_language(self, text, allowed_languages):
+        """Return whether a title is in an allowed language; uncertain short titles pass."""
+        hint = self._fast_language_hint(text, allowed_languages)
+        if hint is not None:
+            return hint
+        try:
+            return detect(text) in allowed_languages
+        except LangDetectException:
+            return True
+
+    def _genre_similarity(self, artist_tags):
+        """Return Jaccard similarity between candidate and seed genre tags."""
+        tags = {str(tag).casefold() for tag in artist_tags}
+        seeds = {str(tag).casefold() for tag in self.seed_genre_set}
+        if not tags or not seeds:
+            return 0.0
+        union = tags | seeds
+        return len(tags & seeds) / len(union) if union else 0.0
+
+    def _candidate_artist_name(self, track):
+        """Return the primary artist name for a valid Spotify track, or None."""
+        names = self._track_artist_names(track)
+        return names[0] if names else None
 
     def build_candidate_pool(self, genre_counter):
-        """Gathers candidate tracks via genre, seed artist, and similar-artist search.
+        """Build a deduplicated candidate pool using genres and one- and two-hop artists."""
+        candidates = {}
+        fresh_track_ids = set()
+        discovered_genres = Counter()
+        processed_artists = set()
+        seed_track_keys = {
+            (
+                normalize_artist_name(self._candidate_artist_name(track) or ""),
+                normalize_track_title(track.get("name", "")),
+            )
+            for track in self.seed_tracks
+        }
 
-        Combines three sources, each fetched round-robin (results_per_turn
-        new results per query per turn, cycling through queries) so that no
-        single genre/artist drains its full budget before the others get a
-        turn: (1) search by a random sample of genres_to_use genres drawn
-        from the genres_to_use * genre_pool_multiplier most specific genres
-        in genre_counter, for diversity across other artists and across
-        runs; (2) a targeted search for the seed artists themselves, to
-        weight their catalog (deep cuts) more heavily; (3) a targeted
-        search for artists on the seed(s)' Last.fm similar-artist list
-        (see _ensure_seed_similar_artists) - a collaborative-filtering
-        signal independent of genre/tag data, which automatically gets
-        leaned on more heavily when the seeds' own tags are too thin for
-        genre search to work well. Deduplicates via (artist, normalized
-        title) so different versions of the same song don't appear
-        multiple times, and excludes the seed tracks themselves as well as
-        excluded_artists / disallowed languages.
-
-        target_total_candidates and min_fresh_fraction are treated as goals
-        to actively work toward rather than passive caps: when sampling
-        genres, not-yet-exhausted ones (see self._search_db) are
-        preferred over ones already known to have no more Spotify results
-        left, since a query that can only replay cached data can't help
-        either goal. If the initial round still falls short of either
-        target, additional not-yet-tried genres are queried in further
-        rounds - each of which necessarily pulls live, fresh results, since
-        a genre only gets picked here if it hasn't been queried yet this run.
-
-        The genres available for this expansion start out limited to
-        whatever genre_counter already contains (the seed artists' own
-        Last.fm tags) - once that fixed list is exhausted, further rounds
-        "snowball" instead: Last.fm tags are fetched for the candidate
-        artists found so far (reusing the same cache/executor as
-        filter_and_rank, so this isn't wasted work), and a newly-seen tag
-        becomes eligible for expansion once it has appeared on at least
-        min_discovered_genre_count distinct candidate artists. Since those
-        artists were themselves already found via a genre/artist search
-        relevant to the seeds, a tag repeatedly co-occurring among them is
-        a meaningfully related sub-genre rather than a one-off/noise tag -
-        this is what keeps the snowball from wandering into unrelated
-        territory as it grows. Expansion is bounded overall by
-        max_candidate_expansion_rounds, after which a genuine shortfall is
-        reported rather than silently returned as if nothing were missing.
-
-        Args:
-            genre_counter: Counter mapping genre tag -> frequency (e.g. from
-                get_seed_artist_ids_and_genres).
-
-        Returns:
-            List of Spotify track objects (dicts), one per unique
-            (artist, normalized title) key.
-        """
-        candidates = {}  # dedup_key -> track
-        # Real candidate count, kept separate from len(candidates): the
-        # dict also holds one None placeholder per seed track (added just
-        # below, so a seed can never be re-added as its own "candidate"),
-        # and those placeholders must NOT count toward
-        # target_total_candidates - counting len(candidates) directly here
-        # used to make the stopping condition fire len(seed_tracks) short
-        # of the requested target every time (off by exactly the number of
-        # seeds, e.g. -1 for a single seed, -2 for two, etc.).
-        candidate_count = 0
-        fresh_track_ids = set()  # track IDs obtained via a live Spotify request this run
-        discovered_genre_counter = Counter()  # tags seen on candidate artists, for snowball expansion
-        artists_with_discovered_tags = set()  # avoids double-counting an artist's tags across rounds
-
-        def add_track(track):
-            nonlocal candidate_count
-            if not track or not track.get("id"):
+        def add_track(track, expected_artist=None):
+            if not isinstance(track, dict) or not track.get("id") or not track.get("name"):
                 return
-            artist_name = track["artists"][0]["name"]
-            if artist_name.lower() in self.excluded_artists:
+            artist = self._candidate_artist_name(track)
+            if not artist or not self._is_allowed_artist(artist):
                 return
-            key = (artist_name.lower(), self.normalize_title(track["name"]))
-            if key in candidates:
+            if expected_artist and not any(
+                normalize_artist_name(name) == normalize_artist_name(expected_artist)
+                for name in self._track_artist_names(track)
+            ):
+                return
+            title_key = normalize_track_title(track["name"])
+            artist_key = normalize_artist_name(artist)
+            if not title_key or (artist_key, title_key) in seed_track_keys:
                 return
             if not self.is_allowed_language(track["name"], frozenset(self.allowed_languages)):
                 return
-            candidates[key] = track
-            candidate_count += 1
+            candidates.setdefault((artist_key, title_key), track)
+
+        def fresh_fraction():
+            ids = {track["id"] for track in candidates.values()}
+            return len(ids & fresh_track_ids) / len(ids) if ids else 0.0
 
         def fetch_round_robin(query_to_artist, per_query_cap):
-            """Cycles through queries, requesting results_per_turn new
-            results per query per round, until every query is exhausted or
-            at its per_query_cap, or target_total_candidates is reached."""
-            requested = {q: 0 for q in query_to_artist}
+            requested = {query: 0 for query in query_to_artist}
             active = set(query_to_artist)
-            while active and candidate_count < self.target_total_candidates:
-                for q in list(active):
-                    if candidate_count >= self.target_total_candidates:
+            while active and len(candidates) < self.target_total_candidates:
+                for query in list(active):
+                    if len(candidates) >= self.target_total_candidates:
                         break
-                    target = min(requested[q] + self.results_per_turn, per_query_cap)
-                    results = self._paginated_search(q, target, fresh_ids=fresh_track_ids)
-                    requested[q] = target
-                    artist_name = query_to_artist[q]
+                    target = min(requested[query] + self.results_per_turn, per_query_cap)
+                    results = self._paginated_search(query, target, fresh_ids=fresh_track_ids)
+                    requested[query] = target
+                    expected_artist = query_to_artist[query]
                     for track in results:
-                        if candidate_count >= self.target_total_candidates:
+                        add_track(track, expected_artist)
+                        if len(candidates) >= self.target_total_candidates:
                             break
-                        if artist_name and not any(
-                            a["name"].lower() == artist_name.lower() for a in track["artists"]
-                        ):
-                            continue
-                        add_track(track)
                     if len(results) < target or target >= per_query_cap:
-                        active.discard(q)
+                        active.discard(query)
 
-        def genre_query_exhausted(genre):
-            return self._is_query_exhausted(f'genre:"{genre}"')
-
-        def current_pool():
-            return [t for t in candidates.values() if t is not None]
-
-        def fresh_fraction(pool):
-            return sum(1 for t in pool if t["id"] in fresh_track_ids) / len(pool) if pool else 0.0
-
-        def update_discovered_genres():
-            """Folds Last.fm tags from any not-yet-processed candidate
-            artists into discovered_genre_counter, for snowball expansion
-            once the original seed-derived genre list runs out. Only
-            artists with at least some genre overlap with the seeds
-            (_genre_similarity > 0) contribute their tags - otherwise a
-            single seed's genre neighborhood can snowball into completely
-            unrelated territory once ordinary co-occurrence is the only
-            gate. Reuses _fetch_artist_infos_batch (same cache/executor as
-            filter_and_rank), so these lookups aren't wasted - they warm
-            the cache for later instead of duplicating work."""
-            pool_artists = {t["artists"][0]["name"] for t in current_pool()}
-            new_artists = pool_artists - artists_with_discovered_tags
-            if not new_artists:
-                return
-            infos = self._fetch_artist_infos_batch(new_artists, max_workers=self.lastfm_max_workers)
-            blocklist_for_discovery = self.LASTFM_JUNK_TAGS | self.excluded_genres
-            for artist_name, info in infos.items():
-                artists_with_discovered_tags.add(artist_name)
-                if self._genre_similarity(info["tags"]) <= 0:
-                    # No overlap at all with the seed genres - this artist's
-                    # tags are treated as unrelated noise and don't get to
-                    # seed new snowball genres, however often they co-occur
-                    # among candidate artists.
-                    continue
-                for tag in info["tags"]:
-                    if tag not in blocklist_for_discovery:
-                        discovered_genre_counter[tag] += 1
-
-        # Never let the seed tracks themselves count as a "new recommendation"
-        for seed_track in self.seed_tracks:
-            key = (seed_track["artists"][0]["name"].lower(), self.normalize_title(seed_track["name"]))
-            candidates[key] = None  # placeholder, filtered out below
-
-        # 1) Genre search for diversity across other artists. Genres still
-        # known to have unexplored Spotify results are preferred over
-        # already-exhausted ones, so a random draw isn't wasted on a query
-        # that can only replay cached data.
         blocklist = self.LASTFM_JUNK_TAGS | self.excluded_genres
-        specific_genres = [g for g in genre_counter if g not in blocklist]
-        specific_genres.sort(key=lambda g: (-g.count(" "), -genre_counter[g]))
-        non_exhausted = [g for g in specific_genres if not genre_query_exhausted(g)]
-        exhausted = [g for g in specific_genres if genre_query_exhausted(g)]
-        ordered_genres = non_exhausted + exhausted
-
-        pool_size = min(len(ordered_genres), self.genres_to_use * self.genre_pool_multiplier)
-        genre_pool = ordered_genres[:pool_size]
-        if genre_pool:
-            top_genres = random.sample(genre_pool, min(self.genres_to_use, len(genre_pool)))
-        else:
-            top_genres = [g for g, _ in genre_counter.most_common(self.genres_to_use)] or ["pop"]
-        print(f"Genres used: {top_genres}")
+        genres = [
+            genre for genre in genre_counter
+            if isinstance(genre, str) and genre.casefold() not in blocklist
+        ]
+        genres.sort(key=lambda genre: (-genre.count(" "), -genre_counter[genre]))
+        active_genres = [genre for genre in genres if not self._is_query_exhausted(f'genre:"{genre}"')]
+        exhausted_genres = [genre for genre in genres if self._is_query_exhausted(f'genre:"{genre}"')]
+        ordered_genres = active_genres + exhausted_genres
+        pool_limit = max(0, self.genres_to_use * self.genre_pool_multiplier)
+        genre_pool = ordered_genres[:pool_limit]
+        selected_genres = random.sample(genre_pool, min(self.genres_to_use, len(genre_pool)))
+        if not selected_genres and not genre_counter:
+            selected_genres = ["pop"]
 
         fetch_round_robin(
-            {f'genre:"{g}"': None for g in top_genres},
+            {f'genre:"{genre}"': None for genre in selected_genres},
             self.max_results_per_genre,
         )
-
-        # 2) Targeted search for the seed artists, to weight their catalog
-        #    (deep cuts) more heavily
         fetch_round_robin(
-            {f'artist:"{a}"': a for a in self.seed_artist_names},
+            {f'artist:"{artist}"': artist for artist in self.seed_artist_names},
             self.max_results_per_seed_artist,
         )
 
-        # 3) Last.fm's own collaborative-filtering similar-artist list for
-        # the seed(s) (see _ensure_seed_similar_artists) - a discovery
-        # signal independent of genre/tag data, and one that automatically
-        # leans harder on this source instead of genre search when the
-        # seeds' own tags are too thin for genre search/snowball expansion
-        # to work well (e.g. a regional or dialect act).
         self._ensure_seed_similar_artists()
-        if self._similar_artist_pool_names:
+        first_hop = self._similar_artist_pool_names or []
+        second_hop = self._two_hop_artist_pool_names or []
+        if first_hop:
             fetch_round_robin(
-                {f'artist:"{a}"': a for a in self._similar_artist_pool_names},
+                {f'artist:"{artist}"': artist for artist in first_hop},
+                self.max_results_per_similar_artist,
+            )
+        if second_hop:
+            fetch_round_robin(
+                {f'artist:"{artist}"': artist for artist in second_hop},
                 self.max_results_per_similar_artist,
             )
 
-        # 4) Expansion rounds: if the initial search left the pool short of
-        # target_total_candidates or min_fresh_fraction, reach for genres
-        # that haven't been tried yet this run instead of quietly returning
-        # less than asked for. Starts with the remaining seed-derived
-        # genres; once those run out, snowballs into genres discovered from
-        # candidate artists found so far (see update_discovered_genres).
-        # Bounded by max_candidate_expansion_rounds so a persistently thin
-        # genre neighborhood can't loop indefinitely.
-        tried_genres = set(top_genres)
-        remaining_genres = [g for g in ordered_genres if g not in tried_genres]
-        expansion_round = 0
+        tried_genres = set(selected_genres)
+        remaining_genres = [genre for genre in ordered_genres if genre not in tried_genres]
+        for expansion_round in range(1, max(0, self.max_candidate_expansion_rounds) + 1):
+            if len(candidates) >= self.target_total_candidates and fresh_fraction() >= self.min_fresh_fraction:
+                break
 
-        while (
-            expansion_round < self.max_candidate_expansion_rounds
-            and (
-                candidate_count < self.target_total_candidates
-                or fresh_fraction(current_pool()) < self.min_fresh_fraction
-            )
-        ):
-            expansion_round += 1
-            # Same cache-saturation issue as genre search (see below)
-            # applies to the seed-artist and similar-artist catalog
-            # searches (sources 2/3 above) - they only ever ran once at a
-            # fixed cap, so once cache-saturated from a previous run
-            # (_paginated_search returns straight from cache whenever
-            # len(collected) >= max_results, with no live request at all)
-            # they'd stay stuck at zero fresh yield forever, no matter how
-            # many expansion rounds ran - and with typically far fewer
-            # seed/similar artists than genre strings to rotate through,
-            # this is often the *more* likely culprit for a persistent
-            # min_fresh_fraction stall than genre search. Boosted every
-            # round, independent of genre-name availability below, since
-            # an artist's catalog can keep yielding fresh tracks via a
-            # higher cap long after the genre-neighborhood well runs dry.
-            expansion_multiplier = 1 + expansion_round
+            multiplier = expansion_round + 1
             fetch_round_robin(
-                {f'artist:"{a}"': a for a in self.seed_artist_names},
-                self.max_results_per_seed_artist * expansion_multiplier,
+                {f'artist:"{artist}"': artist for artist in self.seed_artist_names},
+                self.max_results_per_seed_artist * multiplier,
             )
-            if self._similar_artist_pool_names:
-                fetch_round_robin(
-                    {f'artist:"{a}"': a for a in self._similar_artist_pool_names},
-                    self.max_results_per_similar_artist * expansion_multiplier,
-                )
+            for artists in (first_hop, second_hop):
+                if artists:
+                    fetch_round_robin(
+                        {f'artist:"{artist}"': artist for artist in artists},
+                        self.max_results_per_similar_artist * multiplier,
+                    )
 
             if not remaining_genres:
-                update_discovered_genres()
+                artists = {
+                    self._candidate_artist_name(track)
+                    for track in candidates.values()
+                } - processed_artists
+                artists.discard(None)
+                processed_artists.update(artists)
+                infos = self._fetch_artist_infos_batch(artists, self.lastfm_max_workers)
+                for artist, info in infos.items():
+                    if self._genre_similarity(info["tags"]) <= 0:
+                        continue
+                    for tag in info["tags"]:
+                        tag = str(tag).casefold()
+                        if tag not in blocklist:
+                            discovered_genres[tag] += 1
                 remaining_genres = [
-                    g for g, count in discovered_genre_counter.most_common()
-                    if g not in tried_genres and count >= self.min_discovered_genre_count
-                    and not genre_query_exhausted(g)
+                    genre for genre, count in discovered_genres.most_common()
+                    if genre not in tried_genres
+                    and count >= self.min_discovered_genre_count
+                    and not self._is_query_exhausted(f'genre:"{genre}"')
                 ]
-                if not remaining_genres:
-                    # No new genre *names* left to try this run - but the
-                    # artist-catalog boost above doesn't depend on that,
-                    # so keep looping (subject to the same round/target
-                    # budget) rather than giving up entirely. A later
-                    # round may also find new remaining_genres anyway, if
-                    # the artist-catalog boost just added new artists
-                    # whose tags update_discovered_genres hasn't seen yet.
-                    continue
 
-            batch = remaining_genres[: self.genres_to_use]
-            remaining_genres = remaining_genres[self.genres_to_use :]
+            batch = remaining_genres[:max(1, self.genres_to_use)]
+            remaining_genres = remaining_genres[len(batch):]
             tried_genres.update(batch)
-            print(f"Expanding candidate search (round {expansion_round}): {batch}")
-            # A genre that isn't truly exhausted (Spotify has more results
-            # somewhere) can still be fully cache-saturated *at
-            # max_results_per_genre* from a previous run - _paginated_search
-            # returns straight from cache once len(collected) >= max_results,
-            # with no live request at all, regardless of how many different
-            # genre strings get tried. Progressively raising the cap here
-            # pushes an already-explored-to-the-base-cap genre into
-            # genuinely new offsets instead of guaranteeing another
-            # zero-fresh-yield round - this is what actually breaks a
-            # min_fresh_fraction stall on a seed whose reachable genre
-            # space has already been searched before (repeated/similar
-            # queries), rather than just cycling through more not-yet-tried
-            # genre *names* that hit the same saturated cap.
-            expansion_cap = self.max_results_per_genre * expansion_multiplier
-            fetch_round_robin({f'genre:"{g}"': None for g in batch}, expansion_cap)
+            if batch:
+                fetch_round_robin(
+                    {f'genre:"{genre}"': None for genre in batch},
+                    self.max_results_per_genre * multiplier,
+                )
 
-        pool = current_pool()
-        final_fresh_fraction = fresh_fraction(pool)
-
-        if len(pool) < self.target_total_candidates:
-            print(
-                f"Note: Candidate pool reached {len(pool)}/{self.target_total_candidates} requested "
-                f"after {expansion_round} expansion round(s) - no further un-exhausted genres were available."
+        final_fraction = fresh_fraction()
+        if len(candidates) < self.target_total_candidates:
+            logger.warning(
+                "Candidate pool reached %d/%d tracks after expansion.",
+                len(candidates), self.target_total_candidates,
             )
-        if final_fresh_fraction < self.min_fresh_fraction:
-            print(
-                f"Note: Only {final_fresh_fraction:.0%} of candidates came from fresh Spotify requests "
-                f"this run (target: {self.min_fresh_fraction:.0%})."
+        if final_fraction < self.min_fresh_fraction:
+            logger.warning(
+                "Only %.0f%% of candidates were newly fetched; target is %.0f%%.",
+                final_fraction * 100, self.min_fresh_fraction * 100,
             )
-
-        return pool
-
-    def _genre_similarity(self, artist_tags):
-        """Computes Jaccard similarity between an artist's tags and the seeds.
-
-        Args:
-            artist_tags: Set of Last.fm tag names (lowercased) for a candidate's artist.
-
-        Returns:
-            Float in [0, 1]: |intersection| / |union| with self.seed_genre_set.
-            0.0 if either set is empty.
-        """
-        if not self.seed_genre_set or not artist_tags:
-            return 0.0
-        intersection = self.seed_genre_set & artist_tags
-        union_size = len(self.seed_genre_set) + len(artist_tags) - len(intersection)
-        return len(intersection) / union_size if union_size else 0.0
+        return list(candidates.values())
 
     def _apply_popularity_bias(self, scored):
-        """Nudges similarity scores toward more/less popular tracks.
-
-        Pure post-processing on data already fetched during scoring (no
-        extra API calls): each candidate's track-listener count is turned
-        into a percentile rank *within this run's scored pool* - not
-        against a fixed absolute threshold, so the adjustment scales
-        sensibly whether the pool's tracks have a few thousand or several
-        million listeners (an underground genre's "popular" track can
-        have far fewer listeners than a mainstream genre's obscure one,
-        so a fixed cutoff would behave very differently across seeds).
-
-        Args:
-            scored: List of score dicts as built in filter_and_rank (each
-                already has "track_listeners" and "similarity"). Mutated
-                in place.
-
-        Returns:
-            None.
-        """
-        if self.popularity_bias == 0 or not scored:
+        """Adjust similarity using tied popularity percentiles within this run."""
+        if self.popularity_bias == 0 or len(scored) < 2:
             return
 
-        known = [s for s in scored if s["track_listeners"] is not None]
+        known = [item for item in scored if item["track_listeners"] is not None]
         if len(known) < 2:
-            return  # not enough spread in this pool to rank meaningfully
+            return
+        known.sort(key=lambda item: item["track_listeners"])
 
-        known.sort(key=lambda s: s["track_listeners"])
         n = len(known)
-        for i, s in enumerate(known):
-            percentile = i / (n - 1)  # 0 = least popular in this pool, 1 = most popular
-            # Centered on 0: negative percentile-0.5 (below-median
-            # popularity) combined with a negative popularity_bias
-            # (favoring hidden gems) pushes similarity up, and the
-            # symmetric case does too - either "wanting popular" paired
-            # with an actually-popular track, or "wanting obscure" paired
-            # with an actually-obscure one, gets rewarded.
-            s["similarity"] = max(0.0, min(1.0, s["similarity"] + self.popularity_bias * (percentile - 0.5) * 2))
+        index = 0
+        while index < n:
+            end = index + 1
+            while end < n and known[end]["track_listeners"] == known[index]["track_listeners"]:
+                end += 1
+            percentile = ((index + end - 1) / 2) / (n - 1)
+            adjustment = self.popularity_bias * (percentile - 0.5) * 2
+            for item in known[index:end]:
+                item["similarity"] = max(0.0, min(1.0, item["similarity"] + adjustment))
+            index = end
 
     def filter_and_rank(self, candidates):
-        """Filters candidates and ranks them by genre similarity to the seeds.
-
-        Filter cascade per candidate (same as before):
-            1. Track duration > MIN_TRACK_DURATION_MS (no data needed, cheapest check first).
-            2. Last.fm genre tags against excluded_genres.
-            3. Artist's total listeners >= min_artist_listeners (lower bound
-               only, large artists are allowed as long as the song itself is obscure).
-            4. Track is not one of the artist's top hits.
-            5. Track listener count <= lastfm_listener_ceiling.
-            6. Track listener count >= min_track_listeners.
-
-        Instead of stopping at the first result_limit passing candidates,
-        gathers up to result_limit * similarity_oversample_factor of them,
-        scores each by Jaccard similarity (see _genre_similarity) between its
-        artist's Last.fm tags and self.seed_genre_set, and keeps the
-        result_limit most similar ones. Wherever a candidate's artist
-        appears on a seed's Last.fm similar-artist list (see
-        _ensure_seed_similar_artists), that collaborative-filtering match
-        score is blended in: `similarity = (1-w)*tag_jaccard + w*match`,
-        with w sampled once per call from similarity_blend_weight_range
-        (not per candidate, so scoring stays internally consistent within
-        this run while still adding run-to-run result variety). After all
-        candidates are scored, popularity_bias (if nonzero) nudges scores
-        toward more/less popular tracks based on percentile rank within
-        this run's scored pool (see _apply_popularity_bias) - pure
-        post-processing, no extra requests.
-
-        Candidates are processed in windowed batches (self.lastfm_batch_size
-        tracks at a time) rather than one at a time or all at once: within a
-        batch, Last.fm lookups run concurrently (self.lastfm_max_workers
-        ceiling, adaptively reduced if 429s are observed - see
-        LastFmRequestMonitor), but the early-stop check still runs between
-        batches, so gathering stops as soon as oversample_target passing
-        candidates are found. This trades a small, bounded overfetch (up to
-        one batch's worth of extra lookups) for concurrency within each
-        batch - a fixed one-at-a-time loop can't be parallelized without
-        losing the early-stop property entirely.
-
-        Args:
-            candidates: List of Spotify track objects (dicts), e.g. from
-                build_candidate_pool.
-
-        Returns:
-            List of dicts with the keys "track" (Spotify track object),
-            "track_listeners" (int or None), "artist_listeners" (int or
-            None), and "similarity" (float in [0, 1]). At most
-            self.result_limit entries, sorted by similarity descending. Also
-            stored in self.picks.
-        """
+        """Filter candidates, score them, enforce the per-artist cap, and save picks."""
         pool = list(candidates)
         random.shuffle(pool)
-
-        # Idempotent - a no-op if build_candidate_pool already populated
-        # this (the normal pipeline order), but makes filter_and_rank
-        # robust to being called on its own too.
         self._ensure_seed_similar_artists()
-        # Sampled once for the whole run (not per candidate) so scoring
-        # stays internally consistent across all candidates while still
-        # varying run to run - a deliberate bit of extra result jitter on
-        # top of the existing randomized genre sampling.
-        blend_weight = random.uniform(*self.similarity_blend_weight_range)
-
+        weight_min, weight_max = self.similarity_blend_weight_range
+        blend_weight = random.uniform(weight_min, weight_max)
         oversample_target = self.result_limit * self.similarity_oversample_factor
         scored = []
+        workers = self.lastfm_max_workers
+        clean_batches = 0
 
-        workers = self.lastfm_max_workers  # adaptive: shrinks/grows between batches
-        batch_size = self.lastfm_batch_size
-        consecutive_clean_batches = 0
+        for start in range(0, len(pool), self.lastfm_batch_size):
+            if len(scored) >= oversample_target:
+                break
 
-        i = 0
-        while i < len(pool) and len(scored) < oversample_target:
-            batch = pool[i : i + batch_size]
-            i += batch_size
-
-            # Cheap, sequential pre-filter: no network call needed.
-            batch = [t for t in batch if t.get("duration_ms", 0) > self.MIN_TRACK_DURATION_MS]
+            batch = []
+            for track in pool[start:start + self.lastfm_batch_size]:
+                if not isinstance(track, dict) or not track.get("name") or not track.get("id"):
+                    continue
+                if not isinstance(track.get("duration_ms"), int) or track["duration_ms"] <= self.MIN_TRACK_DURATION_MS:
+                    continue
+                if not self._candidate_artist_name(track):
+                    continue
+                batch.append(track)
             if not batch:
                 continue
 
-            unique_artists = {t["artists"][0]["name"] for t in batch}
-            artist_infos = self._fetch_artist_infos_batch(unique_artists, max_workers=workers)
-
-            # Artist-level filters first (cheap, no extra request) to avoid
-            # spending a track.getInfo request on a track whose artist would
-            # be excluded anyway.
+            artist_names = list(dict.fromkeys(self._candidate_artist_name(track) for track in batch))
+            artist_infos = self._fetch_artist_infos_batch(artist_names, workers)
             survivors = []
-            for track in batch:
-                artist_name = track["artists"][0]["name"]
-                info = artist_infos.get(artist_name, {"tags": set(), "listeners": None, "top_tracks": set()})
 
-                if self.excluded_genres and info["tags"] & self.excluded_genres:
+            for track in batch:
+                artist = self._candidate_artist_name(track)
+                info = artist_infos.get(artist, {"tags": set(), "listeners": None, "top_tracks": set()})
+                artist_tags = {str(tag).casefold() for tag in info["tags"]}
+                if artist_tags & self.excluded_genres:
                     continue
-                if info["listeners"] is not None and info["listeners"] < self.min_artist_listeners:
+                listeners = info["listeners"]
+                if listeners is not None and listeners < self.min_artist_listeners:
                     continue
-                if track["name"].lower() in info["top_tracks"]:
+                if normalize_track_title(track["name"]) in info["top_tracks"]:
                     continue
                 survivors.append((track, info))
 
-            track_listener_results = {}
-            if survivors:
-                callables = [
-                    (lambda track=track: self.lastfm_track_listeners(track["artists"][0]["name"], track["name"]))
+            listener_futures = self._run_concurrent(
+                [
+                    lambda track=track: self.lastfm_track_listeners(
+                        self._candidate_artist_name(track), track["name"]
+                    )
                     for track, _info in survivors
-                ]
-                futures = self._run_concurrent(callables, max_workers=workers)
-                for idx, future in enumerate(futures):
-                    try:
-                        track_listener_results[idx] = future.result()
-                    except Exception as e:
-                        logger.warning("Track listener fetch failed: %s", e)
-                        track_listener_results[idx] = None
+                ],
+                workers,
+            )
+            track_listeners = []
+            for future in listener_futures:
+                try:
+                    track_listeners.append(future.result())
+                except Exception:
+                    logger.exception("Failed to fetch track listener count.")
+                    track_listeners.append(None)
 
-            for idx, (track, info) in enumerate(survivors):
+            for (track, info), listeners in zip(survivors, track_listeners):
                 if len(scored) >= oversample_target:
                     break
-
-                track_listeners = track_listener_results.get(idx)
-                if track_listeners is not None and track_listeners > self.lastfm_listener_ceiling:
+                if listeners is not None and listeners > self.lastfm_listener_ceiling:
                     continue
-                if track_listeners is not None and track_listeners < self.min_track_listeners:
+                if listeners is not None and listeners < self.min_track_listeners:
                     continue
 
-                tag_similarity = self._genre_similarity(info["tags"])
-                lastfm_match = self.seed_similar_match.get(track["artists"][0]["name"].lower())
+                similarity = self._genre_similarity(info["tags"])
+                artist_key = normalize_artist_name(self._candidate_artist_name(track))
+                lastfm_match = self.seed_similar_match.get(artist_key)
                 if lastfm_match is not None:
-                    similarity = (1 - blend_weight) * tag_similarity + blend_weight * lastfm_match
-                else:
-                    similarity = tag_similarity
+                    similarity = (1 - blend_weight) * similarity + blend_weight * lastfm_match
+
                 scored.append({
                     "track": track,
-                    "track_listeners": track_listeners,
+                    "track_listeners": listeners,
                     "artist_listeners": info["listeners"],
-                    "similarity": similarity,
+                    "similarity": max(0.0, min(1.0, similarity)),
                 })
 
-            # Adaptive concurrency: back off hard if this batch saw
-            # meaningful 429s, and only cautiously ramp back up after a run
-            # of clean batches (additive increase / multiplicative decrease).
             throttle_rate = self._lastfm_monitor.recent_throttle_rate
             if throttle_rate >= self._lastfm_monitor.throttle_rate_alert:
                 workers = max(1, workers // 2)
-                cooldown = min(30, self.lastfm_backoff_base * (2 ** (self.lastfm_max_workers - workers)))
-                logger.warning(
-                    "Backing off Last.fm concurrency to %d worker(s), cooling down %.1fs.", workers, cooldown,
-                )
+                cooldown = min(30.0, self.lastfm_backoff_base * (2 ** (self.lastfm_max_workers - workers)))
+                logger.warning("Reducing Last.fm concurrency to %d worker(s); cooling down %.1fs.", workers, cooldown)
                 time.sleep(cooldown)
-                consecutive_clean_batches = 0
+                clean_batches = 0
             else:
-                consecutive_clean_batches += 1
-                if consecutive_clean_batches >= 3 and workers < self.lastfm_max_workers:
+                clean_batches += 1
+                if clean_batches >= 3 and workers < self.lastfm_max_workers:
                     workers += 1
-                    consecutive_clean_batches = 0
+                    clean_batches = 0
 
         self._apply_popularity_bias(scored)
-        scored.sort(key=lambda p: p["similarity"], reverse=True)
-        picks = scored[: self.result_limit]
+        scored.sort(key=lambda item: item["similarity"], reverse=True)
+
+        picks = []
+        artist_counts = Counter()
+        for item in scored:
+            artist = self._candidate_artist_name(item["track"])
+            key = normalize_artist_name(artist)
+            if artist_counts[key] >= self.max_tracks_per_artist:
+                continue
+            picks.append(item)
+            artist_counts[key] += 1
+            if len(picks) >= self.result_limit:
+                break
 
         if len(picks) < self.result_limit:
-            print(f"Note: Only {len(picks)} matching tracks found (out of {len(pool)} candidates).")
-
+            logger.warning("Only %d of %d requested tracks passed filtering.", len(picks), self.result_limit)
         self.picks = picks
         return picks
 
-    # --- Output -----------------------------------------------------------
+    def run_pipeline(self, seed_queries=None):
+        """Run the recommendation pipeline and return structured run metadata."""
+        if seed_queries is not None:
+            if not isinstance(seed_queries, dict) or not seed_queries:
+                raise ValueError("seed_queries must be a non-empty dictionary")
+            self.seed_queries = dict(seed_queries)
+
+        self.seed_tracks = []
+        self.seed_artist_names = []
+        self.seed_genre_set = set()
+        self.picks = []
+        self._similar_artist_pool_names = None
+        self._two_hop_artist_pool_names = None
+        self.seed_similar_match = {}
+        self._artist_info_cache.clear()
+
+        seed_track_ids = self.resolve_seed_track_ids()
+        if not seed_track_ids:
+            raise RuntimeError("No seed tracks resolved from Spotify.")
+
+        seed_artist_ids, genre_counter = self.get_seed_artist_ids_and_genres(seed_track_ids)
+        candidates = self.build_candidate_pool(genre_counter)
+        picks = self.filter_and_rank(candidates)
+
+        return {
+            "seed_track_ids": list(seed_track_ids),
+            "seed_artist_ids": list(seed_artist_ids),
+            "seed_artists": list(self.seed_artist_names),
+            "genres": genre_counter,
+            "candidates": candidates,
+            "picks": picks,
+            "lastfm_health": self.lastfm_health_summary(),
+        }
 
     def print_results(self):
-        """Prints the recommendations stored in self.picks to the console.
-
-        Shows title, artist, track and artist listener counts, and the
-        Spotify link for each track.
-
-        Args:
-            None.
-
-        Returns:
-            None.
-        """
+        """Print the current recommendations to stdout."""
         print("\n--- Recommended Tracks ---")
-        for i, pick in enumerate(self.picks, 1):
+        for index, pick in enumerate(self.picks, 1):
             track = pick["track"]
-            artist_name = track["artists"][0]["name"]
-            url = track["external_urls"]["spotify"]
-            track_listeners = pick["track_listeners"] if pick["track_listeners"] is not None else "?"
-            artist_listeners = pick["artist_listeners"] if pick["artist_listeners"] is not None else "?"
-            similarity = pick.get("similarity")
-            similarity_str = f"{similarity:.2f}" if similarity is not None else "?"
-            print(f"{i}. {track['name']} by {artist_name}")
-            print(f"   Track listeners: {track_listeners} | Artist listeners: {artist_listeners} | "
-                  f"Genre similarity: {similarity_str} | Link: {url}")
-
-    # --- Playlist (raw requests, see module docstring) --------------------
+            artists = self._track_artist_names(track)
+            artist = ", ".join(artists) if artists else "Unknown artist"
+            url = track.get("external_urls", {}).get("spotify", "")
+            track_listeners = pick["track_listeners"]
+            artist_listeners = pick["artist_listeners"]
+            print(f"{index}. {track['name']} by {artist}")
+            print(
+                f"   Track listeners: {track_listeners if track_listeners is not None else '?'} | "
+                f"Artist listeners: {artist_listeners if artist_listeners is not None else '?'} | "
+                f"Similarity: {pick['similarity']:.2f} | Link: {url}"
+            )
 
     def _bearer_headers(self):
-        """Builds HTTP headers with a valid bearer token for raw API requests.
-
-        Args:
-            None.
-
-        Returns:
-            dict with "Authorization" and "Content-Type" headers.
-        """
-        assert self.sp.auth_manager is not None
-        token = self.sp.auth_manager.get_access_token(as_dict=False)
+        """Return authorization headers for direct Spotify Web API requests."""
+        manager = getattr(self.sp, "auth_manager", None)
+        if manager is None:
+            raise RuntimeError("Spotify authentication manager is unavailable")
+        token = manager.get_access_token(as_dict=False)
+        if not token:
+            raise RuntimeError("Spotify did not provide an access token")
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     def _existing_playlist_names(self):
-        """Reads the names of all playlists of the current user.
-
-        Pages through all pages of GET /me/playlists.
-
-        Args:
-            None.
-
-        Returns:
-            Set of existing playlist names (str).
-        """
+        """Return names of the current user's playlists."""
         names = set()
-        results = self.sp.current_user_playlists(limit=50)
-        while results:
-            names.update(p["name"] for p in results["items"])
-            results = self.sp.next(results) if results.get("next") else None
+        page = self.sp.current_user_playlists(limit=50)
+        while page:
+            names.update(item["name"] for item in page.get("items", []) if item.get("name"))
+            page = self.sp.next(page) if page.get("next") else None
         return names
 
     def _unique_playlist_name(self, base_name):
-        """Generates a unique, seed-prefixed playlist name via numbering.
-
-        The name is base_name prefixed with the first configured seed
-        track's title (i.e. the first value in self.seed_queries, in
-        insertion order) so playlists from different seeds are easy to
-        tell apart at a glance. Checks the result against the user's
-        existing playlist names and appends " #2", " #3", etc. on a
-        collision, until the name is free.
-
-        Args:
-            base_name: Desired base name of the playlist, appended after
-                the seed track title.
-
-        Returns:
-            Unique playlist name (str): "{first seed title}: {base_name}",
-            or that string with a number appended if it collides with an
-            existing playlist name.
-        """
+        """Return an unused playlist name prefixed with the first seed title."""
+        if not self.seed_queries:
+            prefix = "SongRadio"
+        else:
+            prefix = next(iter(self.seed_queries.values()))
+        base = f"{prefix}: {base_name}"
         existing = self._existing_playlist_names()
-        name = f"{next(iter(self.seed_queries.values()))}: {base_name}"
-        if name not in existing:
-            return name
-        n = 2
-        while f"{name} #{n}" in existing:
-            n += 1
-        return f"{name} #{n}"
+        if base not in existing:
+            return base
+        suffix = 2
+        while f"{base} #{suffix}" in existing:
+            suffix += 1
+        return f"{base} #{suffix}"
 
-    def save_as_playlist(self, base_name="Song Radio"):
-        """Creates a private playlist with the recommendations (+ optionally seeds).
-
-        Uses raw HTTP requests instead of spotipy methods for creation and
-        population, since the endpoints spotipy uses internally
-        (/users/{id}/playlists, /playlists/{id}/tracks) were removed as of
-        Feb 2026 (see module docstring). The playlist name is deduplicated
-        via numbering through _unique_playlist_name.
-
-        Args:
-            base_name: Desired base name of the playlist.
-
-        Returns:
-            None.
-
-        Raises:
-            requests.exceptions.HTTPError: If creating the playlist or adding
-                the tracks fails.
-        """
-        if not self.picks:
-            print("No tracks available to save.")
-            return
-
+    def _playlist_uris(self):
+        """Return valid, unique Spotify URIs for the current playlist contents."""
         uris = []
+        seen = set()
         if self.include_seed_tracks:
-            uris.extend(t["uri"] for t in self.seed_tracks)
-        uris.extend(pick["track"]["uri"] for pick in self.picks)
+            tracks = self.seed_tracks
+        else:
+            tracks = []
+        tracks += [pick["track"] for pick in self.picks]
 
-        name = self._unique_playlist_name(base_name)
+        for track in tracks:
+            uri = track.get("uri") if isinstance(track, dict) else None
+            if uri and uri not in seen:
+                seen.add(uri)
+                uris.append(uri)
+        return uris
 
-        create_resp = requests.post(
-            "https://api.spotify.com/v1/me/playlists",
-            headers=self._bearer_headers(),
-            json={"name": name, "public": False},
-            timeout=10,
-        )
-        create_resp.raise_for_status()
-        playlist = create_resp.json()
+    @staticmethod
+    def _raise_spotify_error(response, action):
+        """Raise an HTTP error with context when a Spotify request fails."""
+        try:
+            response.raise_for_status()
+        except requests.RequestException:
+            logger.exception("Spotify request failed while %s (HTTP %s).", action, response.status_code)
+            raise
 
-        add_resp = requests.post(
-            f"https://api.spotify.com/v1/playlists/{playlist['id']}/items",
-            headers=self._bearer_headers(),
-            json={"uris": uris},
-            timeout=10,
-        )
-        add_resp.raise_for_status()
-
-        print(f"Playlist '{name}' created: {playlist['external_urls']['spotify']}")
-
-    def playlist_exists(self, playlist_id):
-        """Checks whether a Spotify playlist ID still exists and is accessible.
-
-        Uses GET /playlists/{id} with fields=id to minimise response size.
-        A 404 (deleted/unfollowed playlist) returns False; any other HTTP
-        error is re-raised so genuine auth/network problems aren't silently
-        swallowed.
-
-        Args:
-            playlist_id: Spotify playlist ID string.
-
-        Returns:
-            bool.
-        """
-        resp = requests.get(
-            f"https://api.spotify.com/v1/playlists/{playlist_id}",
-            headers=self._bearer_headers(),
-            params={"fields": "id"},
-            timeout=10,
-        )
-        if resp.status_code == 404:
-            return False
-        resp.raise_for_status()
-        return True
-
-    def create_empty_playlist(self, name, description=None):
-        """Creates a new empty private playlist and returns its ID.
-
-        Args:
-            name: Playlist name (str).
-            description: Optional description (str, max 300 chars).
-
-        Returns:
-            Spotify playlist ID (str).
-
-        Raises:
-            requests.exceptions.HTTPError: If creation fails.
-        """
+    def _create_playlist(self, name, description=None):
+        """Create a private playlist and return its Spotify response."""
         body = {"name": name, "public": False}
-        if description:
+        if description is not None:
             body["description"] = description[:300]
-        resp = requests.post(
+
+        response = requests.post(
             "https://api.spotify.com/v1/me/playlists",
             headers=self._bearer_headers(),
             json=body,
-            timeout=10,
+            timeout=15,
         )
-        resp.raise_for_status()
-        return resp.json()["id"]
+        self._raise_spotify_error(response, "creating a playlist")
+        playlist = response.json()
+        if not isinstance(playlist, dict) or not playlist.get("id"):
+            raise RuntimeError("Spotify returned a playlist response without an ID.")
+        return playlist
+
+    def _write_playlist_items(self, playlist_id, uris):
+        """Replace playlist contents and append further items in API-sized batches."""
+        if not uris:
+            raise ValueError("Cannot write an empty playlist.")
+
+        url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
+        headers = self._bearer_headers()
+        response = requests.put(url, headers=headers, json={"uris": uris[:100]}, timeout=15)
+        self._raise_spotify_error(response, "replacing playlist items")
+
+        for start in range(100, len(uris), 100):
+            response = requests.post(
+                url,
+                headers=headers,
+                json={"uris": uris[start:start + 100]},
+                timeout=15,
+            )
+            self._raise_spotify_error(response, "adding playlist items")
+
+    def save_as_playlist(self, base_name="Song Radio"):
+        """Create a private playlist containing the current picks and optional seeds."""
+        uris = self._playlist_uris()
+        if not uris:
+            raise RuntimeError("No tracks are available to save.")
+
+        name = self._unique_playlist_name(base_name)
+        playlist = self._create_playlist(name)
+        self._write_playlist_items(playlist["id"], uris)
+        url = playlist.get("external_urls", {}).get("spotify")
+        logger.info("Created playlist %r: %s", name, url or playlist["id"])
+        return playlist["id"]
+
+    def playlist_exists(self, playlist_id):
+        """Return whether the playlist exists and is accessible to this account."""
+        if not isinstance(playlist_id, str) or not playlist_id.strip():
+            raise ValueError("playlist_id must be a non-empty string")
+
+        response = requests.get(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}",
+            headers=self._bearer_headers(),
+            params={"fields": "id"},
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return False
+        self._raise_spotify_error(response, f"checking playlist {playlist_id}")
+        return True
+
+    def create_empty_playlist(self, name, description=None):
+        """Create an empty private playlist and return its Spotify ID."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Playlist name must be a non-empty string")
+        playlist = self._create_playlist(name.strip(), description)
+        return playlist["id"]
 
     def update_playlist(self, playlist_id, description=None):
-        """Replaces a playlist's tracks (and optionally description) in place.
+        """Replace playlist contents and optionally update its description."""
+        if not isinstance(playlist_id, str) or not playlist_id.strip():
+            raise ValueError("playlist_id must be a non-empty string")
 
-        Unlike save_as_playlist, this never creates a new playlist - it
-        updates an existing one identified by playlist_id. The intended
-        use case is the Daylist (see Daylist.py), which maintains a single
-        persistent playlist that gets refreshed on each run rather than
-        accumulating new playlists over time.
+        uris = self._playlist_uris()
+        if not uris:
+            raise RuntimeError("No tracks are available; the playlist was not updated.")
 
-        Uses PUT /playlists/{id}/tracks, which replaces the entire
-        tracklist atomically in one request, followed by a PATCH on the
-        playlist details if a description is supplied.
-
-        Args:
-            playlist_id: Spotify playlist ID string (the 22-character
-                base-62 identifier, not the full URI or URL).
-            description: Optional playlist description string. Passed
-                through to Spotify as-is - callers are responsible for
-                keeping it under Spotify's 300-character limit. If None,
-                the playlist description is left unchanged.
-
-        Returns:
-            None.
-
-        Raises:
-            requests.exceptions.HTTPError: If the track-replace or
-                description-update request fails.
-        """
-        if not self.picks:
-            raise RuntimeError("No tracks available; playlist will not be updated.")
-
-        uris = []
-        if self.include_seed_tracks:
-            uris.extend(t["uri"] for t in self.seed_tracks)
-        uris.extend(pick["track"]["uri"] for pick in self.picks)
-
-        replace_resp = requests.put(
-            f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
-            headers=self._bearer_headers(),
-            json={"uris": uris},
-            timeout=10,
-        )
-        replace_resp.raise_for_status()
+        self._write_playlist_items(playlist_id, uris)
 
         if description is not None:
-            details_resp = requests.put(
+            response = requests.put(
                 f"https://api.spotify.com/v1/playlists/{playlist_id}",
                 headers=self._bearer_headers(),
                 json={"description": description[:300]},
-                timeout=10,
+                timeout=15,
             )
-            details_resp.raise_for_status()
+            self._raise_spotify_error(response, f"updating playlist {playlist_id} description")
 
-        print(f"Playlist {playlist_id} updated: https://open.spotify.com/playlist/{playlist_id}")
+        logger.info("Updated playlist https://open.spotify.com/playlist/%s", playlist_id)
 
-    def get_familiarity_scores(self):
-        """Reads per-artist familiarity scores from the persisted streaming
-        history cache (loaded via load_streaming_history) as a plain dict.
+    def close(self):
+        """Shut down the worker pool, close HTTP sessions, and close SQLite connections."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
 
-        This is deliberately a thin read-only accessor rather than being
-        wired directly into scoring - familiarity-based scoring is not yet
-        built into filter_and_rank. The Daylist (see Daylist.py) uses this
-        to apply its own familiarity weighting on top of the standard
-        SongRadio scoring, keeping the two concerns separated.
+        self._lastfm_executor.shutdown(wait=True, cancel_futures=True)
+        with self._sessions_lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for session in sessions:
+            session.close()
 
-        Args:
-            None.
-
-        Returns:
-            dict mapping lowercased artist_name -> weighted_score (float),
-            for every artist present in streaming_history_artists. Empty
-            dict if no streaming history has been loaded yet.
-        """
-        rows = self._search_db.execute(
-            "SELECT artist_name, weighted_score FROM streaming_history_artists"
-        ).fetchall()
-        return {row[0]: row[1] for row in rows}
+        self._lastfm_db.close()
+        self._search_db.close()
