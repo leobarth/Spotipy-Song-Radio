@@ -608,6 +608,17 @@ class SongRadio:
         Returns:
             None.
         """
+        if lastfm_max_retries < 1:
+            raise ValueError("lastfm_max_retries must be at least 1")
+        if lastfm_max_workers < 1:
+            raise ValueError("lastfm_max_workers must be at least 1")
+        if lastfm_batch_size < 1:
+            raise ValueError("lastfm_batch_size must be at least 1")
+        if result_limit < 1:
+            raise ValueError("result_limit must be at least 1")
+        if similarity_oversample_factor < 1:
+            raise ValueError("similarity_oversample_factor must be at least 1")
+
         # --- Spotify / Last.fm connection ---
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyOAuth(
@@ -808,6 +819,7 @@ class SongRadio:
                         delay = base_delay * (2 ** attempt)
                 else:
                     delay = base_delay * (2 ** attempt) + random.uniform(0, base_delay)
+                delay = min(max(delay, 0.0), 60.0)
                 time.sleep(delay)
                 continue
 
@@ -822,6 +834,15 @@ class SongRadio:
 
             try:
                 data = resp.json()
+                if resp.status_code >= 400 or "error" in data:
+                    self._lastfm_monitor.record("error")
+                    logger.warning(
+                        "Last.fm API error for %s (HTTP %s): %s",
+                        method,
+                        resp.status_code,
+                        data.get("message", resp.reason),
+                    )
+                    return {}
             except ValueError as e:
                 self._lastfm_monitor.record("error")
                 logger.warning("Last.fm response for %s was not valid JSON: %s", method, e)
@@ -1590,6 +1611,10 @@ class SongRadio:
                 continue
             items = results.get("tracks", {}).get("items", [])
             time.sleep(self.request_sleep)
+
+            if not items:
+                print(f"Warning: No track results for '{track_name}' by {artist_name}.")
+                continue
 
             def match_score(item):
                 item_artist = item["artists"][0]["name"].lower()
@@ -2859,8 +2884,7 @@ class SongRadio:
                 description-update request fails.
         """
         if not self.picks:
-            print("No tracks available to save.")
-            return
+            raise RuntimeError("No tracks available; playlist will not be updated.")
 
         uris = []
         if self.include_seed_tracks:

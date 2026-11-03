@@ -320,6 +320,11 @@ class StreamingHistoryParser:
             logger.info("StreamingHistoryParser: auto-detected UTC offset %+dh.", self.utc_offset_hours)
         else:
             self.utc_offset_hours = utc_offset_hours
+        if half_life_days <= 0:
+            raise ValueError("half_life_days must be > 0")
+        self._now = now or datetime.now(timezone.utc)
+        if self._now.tzinfo is None or self._now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
 
     def _find_audio_files(self):
         """Lists every Streaming_History_Audio_*.json file in export_dir.
@@ -383,7 +388,10 @@ class StreamingHistoryParser:
         if played_at is None:
             return 0.0
         age_days = (self._now - played_at).total_seconds() / 86400
-        age_days = max(age_days, 0.0)  # clock skew / future timestamp safety net
+        if age_days < 0:
+            logger.warning("Future streaming-history timestamp ignored: %s", ts_str)
+            return 0.0
+
         return 0.5 ** (age_days / self.half_life_days)
 
     def _slot_and_weekday(self, ts_str):
