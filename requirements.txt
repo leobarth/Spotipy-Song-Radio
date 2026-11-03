@@ -1,0 +1,5 @@
+yappi==1.7.6
+requests==2.34.2
+spotipy==2.26.0
+langdetect==1.0.9
+dateutils==0.6.12
