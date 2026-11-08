@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 from zoneinfo import ZoneInfo
+from bisect import bisect_left, bisect_right
 
 from normalization import normalize_artist_name
 from SongRadio import SongRadio
@@ -198,41 +199,54 @@ class Daylist:
         )
         return selected
 
-    def _apply_familiarity_penalty(self):
-        """Penalize familiar artists using tie-aware percentiles among this run's picks."""
-        if not self.radio.picks or self.daylist_familiarity_penalty == 0:
-            self._familiarity_penalty_stats = {}
+    def _apply_familiarity_penalty(self, scored):
+        """Adjust candidate scores before the final Daylist selection.
+
+        Familiarity percentiles are calculated across the scored tracks.
+        Tracks with no known familiarity receive no penalty.
+        """
+        self._familiarity_penalty_stats = {}
+
+        if not scored or self.daylist_familiarity_penalty == 0:
             return
 
         familiarity = self.radio.get_familiarity_scores()
         if not familiarity:
-            self._familiarity_penalty_stats = {}
             return
 
         entries = []
-        for pick in self.radio.picks:
-            artists = self.radio._track_artist_names(pick["track"])
-            if not artists:
-                entries.append((pick, 0.0, "Unknown artist"))
-                continue
-            artist_name = artists[0]
-            score = float(familiarity.get(normalize_artist_name(artist_name), 0.0))
-            entries.append((pick, score, artist_name))
 
-        sorted_scores = sorted(score for _pick, score, _artist in entries)
+        for item in scored:
+            artists = self.radio._track_artist_names(item["track"])
+
+            if not artists:
+                entries.append((item, 0.0, "Unknown artist"))
+                continue
+
+            artist_name = artists[0]
+            artist_key = normalize_artist_name(artist_name)
+            score = float(familiarity.get(artist_key, 0.0))
+            entries.append((item, score, artist_name))
+
+        sorted_scores = sorted(score for _item, score, _artist in entries)
         count = len(sorted_scores)
         stats = {}
 
-        for pick, score, artist_name in entries:
+        for item, score, artist_name in entries:
             if count < 2 or score <= 0:
                 percentile = 0.0
             else:
-                below = sum(value < score for value in sorted_scores)
-                tied = sum(value == score for value in sorted_scores)
+                below = bisect_left(sorted_scores, score)
+                tied = bisect_right(sorted_scores, score) - below
+
                 percentile = (below + (tied - 1) / 2) / (count - 1)
 
             penalty = self.daylist_familiarity_penalty * percentile
-            pick["similarity"] = max(0.0, pick["similarity"] * (1 - penalty))
+            item["similarity"] = max(
+                0.0,
+                item["similarity"] * (1 - penalty),
+            )
+
             stats[artist_name] = {
                 "familiarity_score": score,
                 "percentile": percentile,
@@ -240,7 +254,6 @@ class Daylist:
             }
 
         self._familiarity_penalty_stats = stats
-        self.radio.picks.sort(key=lambda pick: pick["similarity"], reverse=True)
 
     def build_description(self):
         """Build a concise playlist description within Spotify's 300-character limit."""
@@ -287,12 +300,23 @@ class Daylist:
             )
 
         seed_queries = {artist: track for _key, artist, track, _score in seeds}
-        result = self.radio.run_pipeline(seed_queries=seed_queries)
+        result = self.radio.run_pipeline(seed_queries=seed_queries, score_adjuster=self._apply_familiarity_penalty())
         self._dominant_genres = [
             genre for genre, _count in result["genres"].most_common(5)
         ]
 
-        self._apply_familiarity_penalty()
+        picked_artist_keys = {
+            normalize_artist_name(artists[0])
+            for pick in self.radio.picks
+            if (artists := self.radio._track_artist_names(pick["track"]))
+        }
+
+        self._familiarity_penalty_stats = {
+            artist_name: data
+            for artist_name, data in self._familiarity_penalty_stats.items()
+            if normalize_artist_name(artist_name) in picked_artist_keys
+        }
+
         self.radio.print_results()
         logger.info("%s", self.radio.lastfm_health_summary())
 

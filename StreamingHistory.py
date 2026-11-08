@@ -228,17 +228,18 @@ class StreamingHistoryParser:
             try:
                 with open(file_path, "r", encoding="utf-8") as file:
                     records = json.load(file)
-            except (OSError, json.JSONDecodeError) as exc:
-                logger.warning("Skipping unreadable export file %s: %s", file_path, exc)
-                continue
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Could not read streaming-history file {file_path}: {exc}. "
+                    "The import was aborted; stored history was not replaced."
+                ) from exc
 
             if not isinstance(records, list):
-                logger.warning(
-                    "Skipping %s: expected a JSON array, got %s",
-                    file_path,
-                    type(records).__name__,
+                raise RuntimeError(
+                    f"Invalid streaming-history file {file_path}: "
+                    f"expected a JSON array, got {type(records).__name__}. "
+                    "The import was aborted; stored history was not replaced."
                 )
-                continue
 
             for record in records:
                 total_records += 1

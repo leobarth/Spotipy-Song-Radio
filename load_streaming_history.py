@@ -62,6 +62,12 @@ def main(export_dir, timezone_name=None, half_life_days=365.0):
         )
         stats = parser.parse()
 
+        if not stats.artists or not stats.tracks:
+            raise RuntimeError(
+                "The export contains no usable music artists or tracks. "
+                "The import was aborted; stored history was not replaced."
+            )
+
         print(
             f"\nParsed {stats.total_records_processed} record(s):\n"
             f"  Music:      {stats.total_music_plays} plays, "

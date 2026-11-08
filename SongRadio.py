@@ -832,6 +832,27 @@ class SongRadio:
         """Read a cached Spotify query's pagination state."""
         return self._read_query_state(self._search_db, query)
 
+    def _query_cache_expired(self, state):
+        """Return whether a Spotify query's cached results have expired."""
+        fetched_at = state.get("last_fetched_at")
+        return bool(
+            self.cache_ttl_days
+            and fetched_at is not None
+            and time.time() - fetched_at > self.cache_ttl_days * 86400
+        )
+
+    def _reset_cached_query(self, query):
+        """Remove cached associations and pagination state for one query."""
+        with self._search_db:
+            self._search_db.execute(
+                "DELETE FROM query_tracks WHERE query = ?",
+                (query,),
+            )
+            self._search_db.execute(
+                "DELETE FROM queries WHERE query = ?",
+                (query,),
+            )
+
     def _save_query_state(self, query, state):
         """Persist a Spotify query's pagination state."""
         self._search_db.execute(
@@ -1021,66 +1042,156 @@ class SongRadio:
         )
 
     def _is_query_exhausted(self, query):
-        """Return whether Spotify pagination for this query is exhausted or capped."""
-        row = self._search_db.execute(
-            "SELECT exhausted, capped_at_max_offset FROM queries WHERE query = ?",
-            (query,),
-        ).fetchone()
-        return bool(row and (row[0] or row[1]))
+        """Return whether a non-expired query is exhausted or capped."""
+        state = self._get_query_state(query)
+        if self._query_cache_expired(state):
+            return False
+        return state["exhausted"] or state["capped_at_max_offset"]
 
-    def _paginated_search(self, query, max_results, fresh_ids=None):
-        """Fetch Spotify search pages while reusing cached tracks and pagination state."""
+    @staticmethod
+    def _sample_query_results(cached_tracks, newly_fetched, limit):
+        """Prefer newly fetched tracks, then randomly sample cached tracks.
+        Results are deduplicated by Spotify track ID.
+        """
+        if limit <= 0:
+            return []
+        fresh = list(newly_fetched)
+        cached = list(cached_tracks)
+        random.shuffle(fresh)
+        random.shuffle(cached)
+        result = []
+        seen_ids = set()
+        for track in fresh + cached:
+            if not isinstance(track, dict):
+                continue
+            track_id = track.get("id")
+            if not track_id or track_id in seen_ids:
+                continue
+            seen_ids.add(track_id)
+            result.append(track)
+            if len(result) >= limit:
+                break
+        return result
+
+    def _paginated_search(self, query, max_results, fresh_ids=None, metrics=None):
+        """Fetch Spotify search pages and sample results for a query.
+
+        Cached tracks are reused until the query TTL expires. When more
+        results are requested than are cached, subsequent Spotify pages are
+        fetched. Tracks fetched during this call are preferred in the
+        returned sample.
+
+        Args:
+            query: Spotify search query.
+            max_results: Maximum number of tracks to return and pagination
+                target for this call.
+            fresh_ids: Optional set that receives the IDs of tracks returned
+                by Spotify during this call.
+
+        Returns:
+            A list of up to max_results distinct track objects.
+        """
         if max_results <= 0:
             return []
 
         state = self._get_query_state(query)
-        if self.cache_ttl_days and state["last_fetched_at"]:
-            age_days = (time.time() - state["last_fetched_at"]) / 86400
-            if age_days > self.cache_ttl_days:
-                state.update(offsets_fetched=[], exhausted=False, capped_at_max_offset=False)
 
-        collected = self._get_cached_tracks_for_query(query)
-        if state["exhausted"] or len(collected) >= max_results:
-            return collected[:max_results]
+        if self._query_cache_expired(state):
+            logger.info("Spotify query cache expired; resetting %r.", query)
+            self._reset_cached_query(query)
+            state = self._get_query_state(query)
 
-        offset = max(state["offsets_fetched"]) + self.search_limit if state["offsets_fetched"] else 0
+        cached_tracks = self._get_cached_tracks_for_query(query)
+        newly_fetched = []
+
+        # No further Spotify call is needed if enough results are cached,
+        # or the query was already exhausted/capped.
+        if (
+                len(cached_tracks) >= max_results
+                or state["exhausted"]
+                or state["capped_at_max_offset"]
+        ):
+            return self._sample_query_results(
+                cached_tracks,
+                newly_fetched,
+                max_results,
+            )
+
+        offset = (
+            max(state["offsets_fetched"]) + self.search_limit
+            if state["offsets_fetched"]
+            else 0
+        )
         unknown_429_retries = 0
 
         while offset < max_results and offset <= self._max_offset:
             try:
-                results = self.sp.search(q=query, type="track", limit=self.search_limit, offset=offset)
+                results = self.sp.search(
+                    q=query,
+                    type="track",
+                    limit=self.search_limit,
+                    offset=offset,
+                )
+
             except spotipy.exceptions.SpotifyException as exc:
                 if getattr(exc, "http_status", None) == 429:
                     headers = getattr(exc, "headers", None) or {}
                     raw_retry = headers.get("Retry-After")
+
                     try:
-                        retry_after = float(raw_retry) if raw_retry is not None else None
+                        retry_after = (
+                            float(raw_retry)
+                            if raw_retry is not None
+                            else None
+                        )
                     except (TypeError, ValueError):
                         retry_after = None
 
-                    if retry_after is not None and 0 <= retry_after <= self.RATE_LIMIT_AUTO_RETRY_THRESHOLD:
+                    if (
+                            retry_after is not None
+                            and 0 <= retry_after <= self.RATE_LIMIT_AUTO_RETRY_THRESHOLD
+                    ):
                         time.sleep(retry_after + 1)
                         continue
-                    if retry_after is None and unknown_429_retries < self.MAX_UNKNOWN_429_RETRIES:
+
+                    if (
+                            retry_after is None
+                            and unknown_429_retries < self.MAX_UNKNOWN_429_RETRIES
+                    ):
                         unknown_429_retries += 1
                         delay = self.request_sleep * (2 ** unknown_429_retries)
-                        logger.warning("Spotify returned a 429 without Retry-After; retrying in %.1fs.", delay)
+
+                        logger.warning(
+                            "Spotify returned a 429 without Retry-After; "
+                            "retrying in %.1fs.",
+                            delay,
+                        )
                         time.sleep(delay)
                         continue
 
                     self._save_query_state(query, state)
                     raise
 
-                logger.exception("Spotify search failed for query %r.", query)
-                self._save_query_state(query, state)
-                break
-            except requests.RequestException:
-                logger.exception("Network error during Spotify search for query %r.", query)
+                logger.exception(
+                    "Spotify search failed for query %r.",
+                    query,
+                )
                 self._save_query_state(query, state)
                 break
 
+            except requests.RequestException:
+                logger.exception(
+                    "Network error during Spotify search for query %r.",
+                    query,
+                )
+                self._save_query_state(query, state)
+                break
+
+            if metrics is not None:
+                metrics["spotify_pages"] += 1
             time.sleep(self.request_sleep)
             unknown_429_retries = 0
+
             items = (results or {}).get("tracks", {}).get("items", [])
             state["offsets_fetched"].append(offset)
             state["last_fetched_at"] = time.time()
@@ -1093,8 +1204,10 @@ class SongRadio:
             for track in items:
                 if not isinstance(track, dict) or not track.get("id"):
                     continue
+
                 self._store_track_for_query(query, track)
-                collected.append(track)
+                newly_fetched.append(track)
+
                 if fresh_ids is not None:
                     fresh_ids.add(track["id"])
 
@@ -1105,7 +1218,20 @@ class SongRadio:
             state["capped_at_max_offset"] = True
             self._save_query_state(query, state)
 
-        return collected[:max_results]
+        logger.debug(
+            "Spotify query %r: %d cached tracks, %d newly fetched tracks, "
+            "requested limit %d.",
+            query,
+            len(cached_tracks),
+            len(newly_fetched),
+            max_results,
+        )
+
+        return self._sample_query_results(
+            cached_tracks,
+            newly_fetched,
+            max_results,
+        )
 
     @staticmethod
     def _track_artist_names(track):
@@ -1400,11 +1526,33 @@ class SongRadio:
         return names[0] if names else None
 
     def build_candidate_pool(self, genre_counter):
-        """Build a deduplicated candidate pool using genres and one- and two-hop artists."""
+        """Build a bounded candidate pool and improve its fresh fraction.
+
+        A track is considered fresh when Spotify returned its ID during this
+        run. Fresh candidates can replace non-fresh candidates when the pool
+        is already full.
+        """
+        if (
+                isinstance(self.results_per_turn, bool)
+                or not isinstance(self.results_per_turn, int)
+                or self.results_per_turn < 1
+        ):
+            raise ValueError("results_per_turn must be a positive integer")
+
+        if (
+                isinstance(self.target_total_candidates, bool)
+                or not isinstance(self.target_total_candidates, int)
+                or self.target_total_candidates < 1
+        ):
+            raise ValueError("target_total_candidates must be a positive integer")
+
         candidates = {}
         fresh_track_ids = set()
         discovered_genres = Counter()
         processed_artists = set()
+
+        metrics = Counter()
+
         seed_track_keys = {
             (
                 normalize_artist_name(self._candidate_artist_name(track) or ""),
@@ -1413,66 +1561,209 @@ class SongRadio:
             for track in self.seed_tracks
         }
 
+        def fresh_fraction():
+            """Return the share of current candidates fetched during this run."""
+            if not candidates:
+                return 0.0
+
+            fresh_count = sum(
+                track["id"] in fresh_track_ids
+                for track in candidates.values()
+            )
+            return fresh_count / len(candidates)
+
+        def target_reached():
+            """Return whether both pool size and freshness targets are met."""
+            return (
+                    len(candidates) >= self.target_total_candidates
+                    and fresh_fraction() >= self.min_fresh_fraction
+            )
+
         def add_track(track, expected_artist=None):
+            """Validate a track and add it to the bounded candidate pool."""
             if not isinstance(track, dict) or not track.get("id") or not track.get("name"):
                 return
+
             artist = self._candidate_artist_name(track)
             if not artist or not self._is_allowed_artist(artist):
                 return
+
             if expected_artist and not any(
-                normalize_artist_name(name) == normalize_artist_name(expected_artist)
-                for name in self._track_artist_names(track)
+                    normalize_artist_name(name) == normalize_artist_name(expected_artist)
+                    for name in self._track_artist_names(track)
             ):
                 return
+
             title_key = normalize_track_title(track["name"])
             artist_key = normalize_artist_name(artist)
+
             if not title_key or (artist_key, title_key) in seed_track_keys:
                 return
-            if not self.is_allowed_language(track["name"], frozenset(self.allowed_languages)):
+
+            if not self.is_allowed_language(
+                    track["name"],
+                    frozenset(self.allowed_languages),
+            ):
                 return
-            candidates.setdefault((artist_key, title_key), track)
 
-        def fresh_fraction():
-            ids = {track["id"] for track in candidates.values()}
-            return len(ids & fresh_track_ids) / len(ids) if ids else 0.0
+            candidate_key = (artist_key, title_key)
+            is_fresh = track["id"] in fresh_track_ids
+            existing = candidates.get(candidate_key)
 
-        def fetch_round_robin(query_to_artist, per_query_cap):
+            if existing is not None:
+                # Prefer a newly fetched version over a non-fresh version of
+                # the same normalized artist/title combination.
+                if is_fresh and existing["id"] not in fresh_track_ids:
+                    candidates[candidate_key] = track
+                    metrics["fresh_version_replacements"] += 1
+                return
+
+            if len(candidates) < self.target_total_candidates:
+                candidates[candidate_key] = track
+                if is_fresh:
+                    metrics["fresh_added"] += 1
+                return
+
+            if not is_fresh:
+                return
+
+            # The pool is full. Replace a randomly chosen non-fresh candidate.
+            non_fresh_keys = [
+                key
+                for key, candidate in candidates.items()
+                if candidate["id"] not in fresh_track_ids
+            ]
+
+            if non_fresh_keys:
+                removed_key = random.choice(non_fresh_keys)
+                del candidates[removed_key]
+                candidates[candidate_key] = track
+                metrics["non_fresh_replacements"] += 1
+
+        def next_query_offset(query):
+            """Return the next Spotify offset, ignoring expired query state."""
+            state = self._get_query_state(query)
+
+            if self._query_cache_expired(state):
+                return 0
+
+            offsets = state["offsets_fetched"]
+            return max(offsets) + self.search_limit if offsets else 0
+
+        def fetch_round_robin(query_to_artist, per_query_cap, seek_fresh=False):
+            """Fetch queries in turns until the applicable target is reached.
+
+            In normal mode, stop when the candidate pool is full.
+
+            In freshness mode, continue even with a full pool. For each query,
+            request a range extending beyond its last fetched offset whenever
+            the configured cap permits it.
+            """
+            if per_query_cap <= 0 or not query_to_artist:
+                return
+
             requested = {query: 0 for query in query_to_artist}
             active = set(query_to_artist)
-            while active and len(candidates) < self.target_total_candidates:
-                for query in list(active):
-                    if len(candidates) >= self.target_total_candidates:
+
+            while active:
+                if seek_fresh:
+                    if target_reached():
                         break
-                    target = min(requested[query] + self.results_per_turn, per_query_cap)
-                    results = self._paginated_search(query, target, fresh_ids=fresh_track_ids)
+                elif len(candidates) >= self.target_total_candidates:
+                    break
+
+                for query in list(active):
+                    if seek_fresh:
+                        if target_reached():
+                            break
+                    elif len(candidates) >= self.target_total_candidates:
+                        break
+
+                    previous_offset = next_query_offset(query)
+
+                    if seek_fresh:
+                        # Request beyond the cached pagination cursor so that
+                        # _paginated_search can fetch another Spotify page.
+                        desired = max(
+                            requested[query] + self.results_per_turn,
+                            previous_offset + 1,
+                        )
+                    else:
+                        desired = requested[query] + self.results_per_turn
+
+                    target = min(desired, per_query_cap)
+
+                    results = self._paginated_search(
+                        query,
+                        target,
+                        fresh_ids=fresh_track_ids,
+                        metrics=metrics,
+                    )
                     requested[query] = target
+
                     expected_artist = query_to_artist[query]
+
                     for track in results:
                         add_track(track, expected_artist)
-                        if len(candidates) >= self.target_total_candidates:
+
+                        if seek_fresh:
+                            if target_reached():
+                                break
+                        elif len(candidates) >= self.target_total_candidates:
                             break
-                    if len(results) < target or target >= per_query_cap:
+
+                    state = self._get_query_state(query)
+                    current_offset = next_query_offset(query)
+
+                    if state["exhausted"] or state["capped_at_max_offset"]:
+                        active.discard(query)
+                    elif target >= per_query_cap:
+                        active.discard(query)
+                    elif seek_fresh and current_offset <= previous_offset:
+                        # No new page was fetched. Avoid repeatedly sampling
+                        # the same cached range in this expansion call.
+                        active.discard(query)
+                    elif not seek_fresh and len(results) < target:
                         active.discard(query)
 
         blocklist = self.LASTFM_JUNK_TAGS | self.excluded_genres
+
         genres = [
-            genre for genre in genre_counter
+            genre
+            for genre in genre_counter
             if isinstance(genre, str) and genre.casefold() not in blocklist
         ]
         genres.sort(key=lambda genre: (-genre.count(" "), -genre_counter[genre]))
-        active_genres = [genre for genre in genres if not self._is_query_exhausted(f'genre:"{genre}"')]
-        exhausted_genres = [genre for genre in genres if self._is_query_exhausted(f'genre:"{genre}"')]
+
+        active_genres = [
+            genre
+            for genre in genres
+            if not self._is_query_exhausted(f'genre:"{genre}"')
+        ]
+        exhausted_genres = [
+            genre
+            for genre in genres
+            if self._is_query_exhausted(f'genre:"{genre}"')
+        ]
+
         ordered_genres = active_genres + exhausted_genres
         pool_limit = max(0, self.genres_to_use * self.genre_pool_multiplier)
         genre_pool = ordered_genres[:pool_limit]
-        selected_genres = random.sample(genre_pool, min(self.genres_to_use, len(genre_pool)))
+
+        selected_genres = random.sample(
+            genre_pool,
+            min(self.genres_to_use, len(genre_pool)),
+        )
+
         if not selected_genres and not genre_counter:
             selected_genres = ["pop"]
 
+        # Initial candidate gathering: stop when the pool is full.
         fetch_round_robin(
             {f'genre:"{genre}"': None for genre in selected_genres},
             self.max_results_per_genre,
         )
+
         fetch_round_robin(
             {f'artist:"{artist}"': artist for artist in self.seed_artist_names},
             self.max_results_per_seed_artist,
@@ -1481,11 +1772,13 @@ class SongRadio:
         self._ensure_seed_similar_artists()
         first_hop = self._similar_artist_pool_names or []
         second_hop = self._two_hop_artist_pool_names or []
+
         if first_hop:
             fetch_round_robin(
                 {f'artist:"{artist}"': artist for artist in first_hop},
                 self.max_results_per_similar_artist,
             )
+
         if second_hop:
             fetch_round_robin(
                 {f'artist:"{artist}"': artist for artist in second_hop},
@@ -1493,65 +1786,129 @@ class SongRadio:
             )
 
         tried_genres = set(selected_genres)
-        remaining_genres = [genre for genre in ordered_genres if genre not in tried_genres]
-        for expansion_round in range(1, max(0, self.max_candidate_expansion_rounds) + 1):
-            if len(candidates) >= self.target_total_candidates and fresh_fraction() >= self.min_fresh_fraction:
+        remaining_genres = [
+            genre for genre in ordered_genres
+            if genre not in tried_genres
+        ]
+
+        for expansion_round in range(
+                1,
+                max(0, self.max_candidate_expansion_rounds) + 1,
+        ):
+            if target_reached():
                 break
 
+            before_count = len(candidates)
+            before_fraction = fresh_fraction()
+            before_fresh_ids = len(fresh_track_ids)
+            before_pages = metrics["spotify_pages"]
+            before_added = metrics["fresh_added"]
+            before_replaced = metrics["non_fresh_replacements"]
+            before_version_replaced = metrics["fresh_version_replacements"]
+
             multiplier = expansion_round + 1
+
             fetch_round_robin(
-                {f'artist:"{artist}"': artist for artist in self.seed_artist_names},
+                {
+                    f'artist:"{artist}"': artist
+                    for artist in self.seed_artist_names
+                },
                 self.max_results_per_seed_artist * multiplier,
+                seek_fresh=True,
             )
+
             for artists in (first_hop, second_hop):
-                if artists:
+                if artists and not target_reached():
                     fetch_round_robin(
                         {f'artist:"{artist}"': artist for artist in artists},
                         self.max_results_per_similar_artist * multiplier,
+                        seek_fresh=True,
                     )
 
-            if not remaining_genres:
+            if selected_genres and not target_reached():
+                fetch_round_robin(
+                    {f'genre:"{genre}"': None for genre in selected_genres},
+                    self.max_results_per_genre * multiplier,
+                    seek_fresh=True,
+                )
+
+            if not target_reached() and not remaining_genres:
                 artists = {
-                    self._candidate_artist_name(track)
-                    for track in candidates.values()
-                } - processed_artists
+                              self._candidate_artist_name(track)
+                              for track in candidates.values()
+                          } - processed_artists
+
                 artists.discard(None)
                 processed_artists.update(artists)
-                infos = self._fetch_artist_infos_batch(artists, self.lastfm_max_workers)
+
+                infos = self._fetch_artist_infos_batch(
+                    artists,
+                    self.lastfm_max_workers,
+                )
+
                 for artist, info in infos.items():
                     if self._genre_similarity(info["tags"]) <= 0:
                         continue
+
                     for tag in info["tags"]:
                         tag = str(tag).casefold()
                         if tag not in blocklist:
                             discovered_genres[tag] += 1
+
                 remaining_genres = [
-                    genre for genre, count in discovered_genres.most_common()
+                    genre
+                    for genre, count in discovered_genres.most_common()
                     if genre not in tried_genres
-                    and count >= self.min_discovered_genre_count
-                    and not self._is_query_exhausted(f'genre:"{genre}"')
+                       and count >= self.min_discovered_genre_count
+                       and not self._is_query_exhausted(f'genre:"{genre}"')
                 ]
 
-            batch = remaining_genres[:max(1, self.genres_to_use)]
-            remaining_genres = remaining_genres[len(batch):]
-            tried_genres.update(batch)
-            if batch:
-                fetch_round_robin(
-                    {f'genre:"{genre}"': None for genre in batch},
-                    self.max_results_per_genre * multiplier,
-                )
+            if not target_reached():
+                batch = remaining_genres[:max(1, self.genres_to_use)]
+                remaining_genres = remaining_genres[len(batch):]
+                tried_genres.update(batch)
+
+                if batch:
+                    fetch_round_robin(
+                        {f'genre:"{genre}"': None for genre in batch},
+                        self.max_results_per_genre * multiplier,
+                        seek_fresh=True,
+                    )
+
+            logger.info(
+                "Candidate expansion round %d: "
+                "pool %d -> %d, freshness %.1f%% -> %.1f%%, "
+                "Spotify pages %d, new fresh IDs %d, "
+                "fresh candidates added %d, non-fresh replaced %d, "
+                "versions replaced %d.",
+                expansion_round,
+                before_count,
+                len(candidates),
+                before_fraction * 100,
+                fresh_fraction() * 100,
+                metrics["spotify_pages"] - before_pages,
+                len(fresh_track_ids) - before_fresh_ids,
+                metrics["fresh_added"] - before_added,
+                metrics["non_fresh_replacements"] - before_replaced,
+                metrics["fresh_version_replacements"] - before_version_replaced,
+            )
 
         final_fraction = fresh_fraction()
+
         if len(candidates) < self.target_total_candidates:
             logger.warning(
                 "Candidate pool reached %d/%d tracks after expansion.",
-                len(candidates), self.target_total_candidates,
+                len(candidates),
+                self.target_total_candidates,
             )
+
         if final_fraction < self.min_fresh_fraction:
             logger.warning(
                 "Only %.0f%% of candidates were newly fetched; target is %.0f%%.",
-                final_fraction * 100, self.min_fresh_fraction * 100,
+                final_fraction * 100,
+                self.min_fresh_fraction * 100,
             )
+
         return list(candidates.values())
 
     def _apply_popularity_bias(self, scored):
@@ -1576,7 +1933,7 @@ class SongRadio:
                 item["similarity"] = max(0.0, min(1.0, item["similarity"] + adjustment))
             index = end
 
-    def filter_and_rank(self, candidates):
+    def filter_and_rank(self, candidates, score_adjuster=None):
         """Filter candidates, score them, enforce the per-artist cap, and save picks."""
         pool = list(candidates)
         random.shuffle(pool)
@@ -1673,6 +2030,10 @@ class SongRadio:
                     clean_batches = 0
 
         self._apply_popularity_bias(scored)
+
+        if score_adjuster is not None:
+            score_adjuster(scored)
+
         scored.sort(key=lambda item: item["similarity"], reverse=True)
 
         picks = []
@@ -1692,7 +2053,7 @@ class SongRadio:
         self.picks = picks
         return picks
 
-    def run_pipeline(self, seed_queries=None):
+    def run_pipeline(self, seed_queries=None, score_adjuster=None):
         """Run the recommendation pipeline and return structured run metadata."""
         if seed_queries is not None:
             if not isinstance(seed_queries, dict) or not seed_queries:
@@ -1714,7 +2075,7 @@ class SongRadio:
 
         seed_artist_ids, genre_counter = self.get_seed_artist_ids_and_genres(seed_track_ids)
         candidates = self.build_candidate_pool(genre_counter)
-        picks = self.filter_and_rank(candidates)
+        picks = self.filter_and_rank(candidates, score_adjuster=score_adjuster)
 
         return {
             "seed_track_ids": list(seed_track_ids),
@@ -1781,11 +2142,8 @@ class SongRadio:
         """Return valid, unique Spotify URIs for the current playlist contents."""
         uris = []
         seen = set()
-        if self.include_seed_tracks:
-            tracks = self.seed_tracks
-        else:
-            tracks = []
-        tracks += [pick["track"] for pick in self.picks]
+        tracks = list(self.seed_tracks) if self.include_seed_tracks else []
+        tracks.extend(pick["track"] for pick in self.picks)
 
         for track in tracks:
             uri = track.get("uri") if isinstance(track, dict) else None
