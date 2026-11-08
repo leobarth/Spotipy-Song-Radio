@@ -300,7 +300,7 @@ class Daylist:
             )
 
         seed_queries = {artist: track for _key, artist, track, _score in seeds}
-        result = self.radio.run_pipeline(seed_queries=seed_queries, score_adjuster=self._apply_familiarity_penalty())
+        result = self.radio.run_pipeline(seed_queries=seed_queries, score_adjuster=self._apply_familiarity_penalty)
         self._dominant_genres = [
             genre for genre, _count in result["genres"].most_common(5)
         ]
